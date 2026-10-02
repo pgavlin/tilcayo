@@ -1,3 +1,4 @@
 /target/
+/TODO.md
 *.swp
 .DS_Store
