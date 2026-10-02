@@ -2,8 +2,22 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use super::{Frame, Rect};
 
-/// A single-slot mailbox containing the newest frame not yet taken by the worker.
-/// Replaced frame damage is carried into the replacement frame.
+/// A single-slot mailbox that retains the most recently submitted frame.
+///
+/// Submission does not wait for capacity. If another frame is pending, the new
+/// frame replaces it; a frame already taken by a consumer is unaffected.
+/// "Latest" means most recently submitted—the mailbox does not inspect or order
+/// frame serials. Clones share the same pending slot and closure state.
+///
+/// Damage from a replaced frame is added to the replacement so changes remain
+/// visible when intermediate frames are skipped. This requires each [`Frame`]
+/// to contain the complete current framebuffer. If the framebuffer dimensions
+/// differ, the replacement is marked as fully damaged instead. During
+/// replacement, more than 32 accumulated nonempty rectangles are reduced to
+/// their clipped bounding rectangle to bound damage bookkeeping.
+///
+/// Closing the mailbox rejects new submissions and wakes blocked consumers. A
+/// frame already pending remains available before the mailbox reports closure.
 #[derive(Clone, Default)]
 pub struct LatestFrameMailbox {
     shared: Arc<(Mutex<State>, Condvar)>,
@@ -94,6 +108,8 @@ impl LatestFrameMailbox {
     }
 
     /// Closes the mailbox and wakes blocked consumers.
+    ///
+    /// A frame already pending remains available for one final take.
     pub fn close(&self) {
         let (lock, ready) = &*self.shared;
         lock.lock().expect("latest-frame mailbox poisoned").closed = true;

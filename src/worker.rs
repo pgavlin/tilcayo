@@ -38,7 +38,16 @@ pub trait PresentationObserver: Send + Sync + 'static {
 
 impl PresentationObserver for () {}
 
-/// Owns blocking terminal output on a dedicated thread.
+/// Serializes framebuffer presentation and terminal control output on a
+/// dedicated thread.
+///
+/// Frame submission does not wait for terminal I/O, and only the newest pending
+/// frame is retained. Presentation and control writes are serialized, and only
+/// the newest pending control write is retained.
+///
+/// An output failure stops the worker and is available through [`Self::error`].
+/// Call [`Self::shutdown`] to join the thread and receive its final error.
+/// Dropping the worker requests closure but does not wait for the thread.
 pub struct PresenterWorker {
     mailbox: LatestFrameMailbox,
     error: Arc<Mutex<Option<io::Error>>>,
