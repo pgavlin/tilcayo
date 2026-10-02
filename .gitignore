@@ -1,4 +1,5 @@
 /target/
 /TODO.md
+/RELEASING.md
 *.swp
 .DS_Store
