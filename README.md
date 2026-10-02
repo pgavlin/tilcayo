@@ -1,5 +1,7 @@
 # tilcayo
 
+[![CI](https://github.com/pgavlin/tilcayo/actions/workflows/ci.yml/badge.svg)](https://github.com/pgavlin/tilcayo/actions/workflows/ci.yml)
+
 Tilcayo is a low-level terminal GUI runtime built around the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
 It owns terminal input, graphics output, and session lifecycle while leaving
