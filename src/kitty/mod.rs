@@ -127,19 +127,7 @@ impl KittyPresenter {
         placement: Placement,
     ) -> io::Result<PresentStats> {
         let size_changed = self.initialized_size != Some(frame.size());
-        let mut damage = plan_damage(
-            frame.width,
-            frame.height,
-            frame.damage.iter().copied(),
-            size_changed,
-            self.damage_policy,
-        );
-        // Baseline graphics has no in-place pixel update. Re-transmit and
-        // replace the stable image whenever damaged pixels must change.
-        let initialize = size_changed || (!self.animation && !damage.is_empty());
-        if initialize {
-            damage = vec![Rect::full(frame.width, frame.height)];
-        }
+        let (damage, initialize) = self.planned_damage(frame, size_changed);
         if damage.is_empty() && self.placement == Some(placement) {
             return Ok(PresentStats {
                 serial: frame.serial,
@@ -168,6 +156,32 @@ impl KittyPresenter {
             self.invalidate();
         }
         result
+    }
+
+    fn planned_damage(&self, frame: &Frame, size_changed: bool) -> (Vec<Rect>, bool) {
+        let mut damage = plan_damage(
+            frame.width,
+            frame.height,
+            frame.damage.iter().copied(),
+            size_changed,
+            self.damage_policy,
+        );
+        // Baseline graphics has no in-place pixel update. Re-transmit and
+        // replace the stable image whenever damaged pixels must change.
+        let initialize = size_changed || (!self.animation && !damage.is_empty());
+        if initialize {
+            damage = vec![Rect::full(frame.width, frame.height)];
+        } else if damage.len() > 1 && self.transmitter.uses_local_media(self.transfer_options) {
+            // Kitty reconstructs the complete animation frame after each edit.
+            // With local media, one larger edit avoids repeated reconstruction
+            // without increasing terminal-stream payload.
+            damage = vec![damage
+                .iter()
+                .copied()
+                .reduce(Rect::union)
+                .expect("multiple damage rectangles are nonempty")];
+        }
+        (damage, initialize)
     }
 
     fn present_inner(
@@ -305,6 +319,23 @@ mod tests {
 
     fn frame(serial: u64, damage: Vec<Rect>) -> Frame {
         Frame::rgb(serial, 4, 2, 12, Arc::<[u8]>::from(vec![0x44; 24]), damage).unwrap()
+    }
+
+    #[test]
+    fn local_media_coalesces_multiple_animation_edits() {
+        let damaged = frame(2, vec![Rect::new(0, 0, 1, 1), Rect::new(3, 1, 1, 1)]);
+        let mut presenter = KittyPresenter::new(7, true);
+        let (damage, initialize) = presenter.planned_damage(&damaged, false);
+        assert!(!initialize);
+        assert_eq!(damage, [Rect::full(4, 2)]);
+
+        presenter.set_transfer_options(TransferOptions {
+            transport: GraphicsTransport::Direct,
+            ..TransferOptions::default()
+        });
+        let (damage, initialize) = presenter.planned_damage(&damaged, false);
+        assert!(!initialize);
+        assert_eq!(damage.len(), 2);
     }
 
     #[test]

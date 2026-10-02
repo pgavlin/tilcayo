@@ -160,6 +160,14 @@ impl KittyTransmitter {
         }
     }
 
+    pub(crate) fn uses_local_media(&self, options: TransferOptions) -> bool {
+        match options.transport {
+            GraphicsTransport::Auto => self.shared_memory || self.temporary_file,
+            GraphicsTransport::Direct => false,
+            GraphicsTransport::TemporaryFile | GraphicsTransport::SharedMemory => true,
+        }
+    }
+
     /// Writes one Kitty graphics command and its payload.
     ///
     /// `control` supplies the Kitty command parameters preceding the payload.
