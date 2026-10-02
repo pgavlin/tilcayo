@@ -10,7 +10,7 @@ keywords = ["kitty", "terminal", "graphics", "framebuffer"]
 categories = ["graphics", "command-line-interface"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 crossterm = "0.28"
 flate2 = "1"
 libc = "0.2"
