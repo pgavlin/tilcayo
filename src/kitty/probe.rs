@@ -13,7 +13,7 @@ use termwiz::{
     input::{InputEvent, InputParser, KeyCode as TermwizKeyCode, Modifiers as TermwizModifiers},
 };
 
-use crate::{Event, KeyCode, KeyEvent, Modifiers};
+use crate::{Event, KeyCode, KeyEvent, LogicalDpi, Modifiers};
 
 // Runtime input ownership is deliberately phased. During this module's probe,
 // advanced terminal input modes are still disabled and Termwiz parses both
@@ -36,6 +36,13 @@ pub struct GraphicsCapabilities {
     pub animation: bool,
 }
 
+/// Capabilities discovered during the isolated terminal probe phase.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TerminalProbe {
+    pub graphics: GraphicsCapabilities,
+    pub logical_dpi: Option<LogicalDpi>,
+}
+
 /// Actively probes Kitty graphics before the normal Crossterm event reader is
 /// started.
 ///
@@ -46,7 +53,19 @@ pub fn probe(
     output: &mut impl Write,
     timeout: Duration,
 ) -> io::Result<GraphicsCapabilities> {
-    probe_with_events(input, output, timeout).map(|(capabilities, _)| capabilities)
+    probe_terminal(input, output, timeout).map(|probe| probe.graphics)
+}
+
+/// Probe graphics support and Kitty's logical DPI.
+///
+/// This convenience function discards concurrent startup keystrokes. Runtime
+/// integrations should prefer [`probe_terminal_with_events`].
+pub fn probe_terminal(
+    input: &mut (impl Read + AsRawFd),
+    output: &mut impl Write,
+    timeout: Duration,
+) -> io::Result<TerminalProbe> {
+    probe_terminal_with_events(input, output, timeout).map(|(probe, _)| probe)
 }
 
 /// Probe graphics support while decoding unrelated startup keystrokes instead
@@ -58,6 +77,17 @@ pub fn probe_with_events(
     output: &mut impl Write,
     timeout: Duration,
 ) -> io::Result<(GraphicsCapabilities, Vec<Event>)> {
+    probe_terminal_with_events(input, output, timeout)
+        .map(|(probe, events)| (probe.graphics, events))
+}
+
+/// Probe graphics support and Kitty's logical DPI while preserving unrelated
+/// startup keystrokes. All queries share the supplied timeout.
+pub fn probe_terminal_with_events(
+    input: &mut (impl Read + AsRawFd),
+    output: &mut impl Write,
+    timeout: Duration,
+) -> io::Result<(TerminalProbe, Vec<Event>)> {
     let id = std::process::id().wrapping_add(0x5759).max(1);
     write!(output, "\x1b_Gi={id},s=1,v=1,a=q,t=d,f=24,q=0;AAAA\x1b\\")?;
     output.flush()?;
@@ -76,14 +106,18 @@ pub fn probe_with_events(
         }
         animation = probe_animation(input, output, deadline, &mut decoder)?;
     }
+    let logical_dpi = probe_logical_dpi(input, output, deadline, &mut decoder)?;
 
     let events = decoder.finish();
     Ok((
-        GraphicsCapabilities {
-            graphics,
-            shared_memory,
-            temporary_file,
-            animation,
+        TerminalProbe {
+            graphics: GraphicsCapabilities {
+                graphics,
+                shared_memory,
+                temporary_file,
+                animation,
+            },
+            logical_dpi,
         },
         events,
     ))
@@ -180,6 +214,64 @@ fn probe_temporary_file(
     )?;
     output.flush()?;
     wait_for_ack_preserving(input, id, deadline, decoder)
+}
+
+const DPI_X_QUERY: &str = "kitty-query-dpi_x";
+const DPI_Y_QUERY: &str = "kitty-query-dpi_y";
+
+fn probe_logical_dpi(
+    input: &mut (impl Read + AsRawFd),
+    output: &mut impl Write,
+    deadline: Instant,
+    decoder: &mut ProbeDecoder,
+) -> io::Result<Option<LogicalDpi>> {
+    write!(
+        output,
+        "\x1bP+q{};{}\x1b\\",
+        hex_encode(DPI_X_QUERY.as_bytes()),
+        hex_encode(DPI_Y_QUERY.as_bytes())
+    )?;
+    output.flush()?;
+
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if let Some(dpi) = decoder.logical_dpi() {
+            return Ok(Some(dpi));
+        }
+        let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if ready == 0 {
+            break;
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let mut bytes = [0; 256];
+        let count = input.read(&mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        decoder.feed(&bytes[..count], 0);
+    }
+    Ok(decoder.logical_dpi())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    encoded
 }
 
 fn probe_animation(
@@ -325,17 +417,30 @@ struct ProbeDecoder {
     undecoded: Vec<u8>,
     input: InputParser,
     events: Vec<Event>,
+    dpi_x: Option<f64>,
+    dpi_y: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+enum ProtocolString {
+    KittyGraphics,
+    DeviceControl,
 }
 
 impl ProbeDecoder {
     fn feed(&mut self, bytes: &[u8], id: u32) -> Option<bool> {
         const KITTY_PREFIX: &[u8] = b"\x1b_G";
+        const DCS_PREFIX: &[u8] = b"\x1bP";
         const STRING_TERMINATOR: &[u8] = b"\x1b\\";
 
         self.undecoded.extend_from_slice(bytes);
         let mut response = None;
         loop {
-            let Some(start) = find_bytes(&self.undecoded, KITTY_PREFIX) else {
+            let kitty = find_bytes(&self.undecoded, KITTY_PREFIX)
+                .map(|start| (start, ProtocolString::KittyGraphics));
+            let dcs = find_bytes(&self.undecoded, DCS_PREFIX)
+                .map(|start| (start, ProtocolString::DeviceControl));
+            let Some((start, kind)) = earliest(kitty, dcs) else {
                 let retained = if self.undecoded.ends_with(b"\x1b_") {
                     2
                 } else if self.undecoded.ends_with(b"\x1b") {
@@ -351,20 +456,62 @@ impl ProbeDecoder {
                 self.feed_input_prefix(start, true);
                 continue;
             }
-            let Some(end) = find_bytes(&self.undecoded[KITTY_PREFIX.len()..], STRING_TERMINATOR)
-            else {
+            let prefix_len = match kind {
+                ProtocolString::KittyGraphics => KITTY_PREFIX.len(),
+                ProtocolString::DeviceControl => DCS_PREFIX.len(),
+            };
+            let Some(end) = find_bytes(&self.undecoded[prefix_len..], STRING_TERMINATOR) else {
                 break;
             };
-            let command_len = KITTY_PREFIX.len() + end + STRING_TERMINATOR.len();
+            let command_len = prefix_len + end + STRING_TERMINATOR.len();
             let command: Vec<_> = self.undecoded.drain(..command_len).collect();
-            let mut parser = Parser::new();
-            for action in parser.parse_as_vec(&command) {
-                if let Some(ok) = response_for(&action, id) {
-                    response = Some(ok);
+            match kind {
+                ProtocolString::KittyGraphics => {
+                    let mut parser = Parser::new();
+                    for action in parser.parse_as_vec(&command) {
+                        if let Some(ok) = response_for(&action, id) {
+                            response = Some(ok);
+                        }
+                    }
                 }
+                ProtocolString::DeviceControl => self.accept_terminal_query(&command),
             }
         }
         response
+    }
+
+    fn accept_terminal_query(&mut self, command: &[u8]) {
+        let Some(body) = command
+            .strip_prefix(b"\x1bP1+r")
+            .and_then(|body| body.strip_suffix(b"\x1b\\"))
+        else {
+            return;
+        };
+        let Some(separator) = body.iter().position(|byte| *byte == b'=') else {
+            return;
+        };
+        let (name, value) = (&body[..separator], &body[separator + 1..]);
+        let (Some(name), Some(value)) = (hex_decode(name), hex_decode(value)) else {
+            return;
+        };
+        let Some(value) = std::str::from_utf8(&value)
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+        else {
+            return;
+        };
+        if !value.is_finite() || !(1.0..=1000.0).contains(&value) {
+            return;
+        }
+        match name.as_slice() {
+            b"kitty-query-dpi_x" => self.dpi_x = Some(value),
+            b"kitty-query-dpi_y" => self.dpi_y = Some(value),
+            _ => {}
+        }
+    }
+
+    fn logical_dpi(&self) -> Option<LogicalDpi> {
+        LogicalDpi::new(self.dpi_x?, self.dpi_y?)
     }
 
     fn feed_input_prefix(&mut self, len: usize, maybe_more: bool) {
@@ -405,6 +552,31 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn earliest(
+    left: Option<(usize, ProtocolString)>,
+    right: Option<(usize, ProtocolString)>,
+) -> Option<(usize, ProtocolString)> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn hex_decode(encoded: &[u8]) -> Option<Vec<u8>> {
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    encoded
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
 }
 
 fn adapt_probe_input(event: InputEvent) -> Option<Event> {
@@ -488,6 +660,29 @@ mod tests {
             .parse_as_vec(b"\x1b_Gi=77;EINVAL\x1b\\")
             .iter()
             .any(|action| response_for(action, 77) == Some(true)));
+    }
+
+    #[test]
+    fn decodes_fragmented_logical_dpi_responses() {
+        let mut decoder = ProbeDecoder::default();
+        decoder.feed(b"\x1bP1+r6b697474792d71756572792d6470695f78=313434\x1b", 0);
+        assert_eq!(decoder.logical_dpi(), None);
+        decoder.feed(
+            b"\\\x1bP1+r6b697474792d71756572792d6470695f79=3132302e35\x1b\\",
+            0,
+        );
+        assert_eq!(decoder.logical_dpi(), LogicalDpi::new(144.0, 120.5));
+    }
+
+    #[test]
+    fn rejects_invalid_logical_dpi_responses() {
+        let mut decoder = ProbeDecoder::default();
+        decoder.feed(b"\x1bP1+r6b697474792d71756572792d6470695f78=30\x1b\\", 0);
+        decoder.feed(
+            b"\x1bP1+r6b697474792d71756572792d6470695f79=4e614e\x1b\\",
+            0,
+        );
+        assert_eq!(decoder.logical_dpi(), None);
     }
 
     #[test]

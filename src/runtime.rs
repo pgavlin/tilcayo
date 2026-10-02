@@ -3,7 +3,7 @@ use std::{io, sync::Arc, time::Duration};
 use crate::{
     clipboard::osc52,
     input::EventReader,
-    kitty::{probe_with_events, GraphicsCapabilities, KittyPresenter, Placement},
+    kitty::{probe_terminal_with_events, GraphicsCapabilities, KittyPresenter, Placement},
     Event, Frame, PresentationObserver, PresenterWorker, TerminalCapabilities, TerminalSession,
 };
 
@@ -60,7 +60,9 @@ impl Runtime {
         let (graphics, pending_events) = if let Some(timeout) = config.probe_timeout {
             let mut input = io::stdin().lock();
             let mut output = io::stdout().lock();
-            probe_with_events(&mut input, &mut output, timeout)?
+            let (probe, events) = probe_terminal_with_events(&mut input, &mut output, timeout)?;
+            capabilities.logical_dpi = probe.logical_dpi;
+            (probe.graphics, events)
         } else {
             (
                 GraphicsCapabilities {

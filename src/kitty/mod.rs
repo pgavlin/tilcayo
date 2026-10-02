@@ -4,7 +4,10 @@ mod transport;
 use std::io::{self, Write};
 
 use crate::{plan_damage, DamagePolicy, Frame, Rect};
-pub use probe::{probe, probe_with_events, wait_for_ack, GraphicsCapabilities};
+pub use probe::{
+    probe, probe_terminal, probe_terminal_with_events, probe_with_events, wait_for_ack,
+    GraphicsCapabilities, TerminalProbe,
+};
 pub use transport::{
     GraphicsTransport, TransferMedium, TransferOptions, TransferStats, TransportManager, ZlibPolicy,
 };

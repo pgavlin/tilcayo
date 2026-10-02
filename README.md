@@ -14,6 +14,7 @@ It provides:
 - verified POSIX shared-memory and temporary-file transfers for local updates;
 - direct transfer with adaptive zlib compression when local media are unavailable;
 - capability probing with fragmented-reply parsing and preservation of concurrent startup input;
+- optional Kitty logical-DPI discovery for point-sized UI and font scaling;
 - raw mode, alternate-screen, keyboard, mouse, focus, paste, and resize setup;
 - a single stoppable terminal event reader;
 - pixel-pointer mapping through the image placement;
@@ -50,10 +51,13 @@ runtime.shutdown()?;
 ```
 
 `Runtime` performs capability probing before starting its event reader and owns
-normal graphics and control writes thereafter. Lower-level presenter, transport,
-and event-reader components remain public for custom integrations. A completed
-presentation means that the entire command was written and flushed where
-required; it is not a display acknowledgement from the terminal.
+normal graphics and control writes thereafter. When Kitty answers its
+`dpi_x`/`dpi_y` terminal queries, `runtime.capabilities().logical_dpi` exposes
+that logical UI/font DPI; it is not necessarily the monitor's physical DPI.
+Lower-level presenter, transport, and event-reader components remain public for
+custom integrations. A completed presentation means that the entire command
+was written and flushed where required; it is not a display acknowledgement
+from the terminal.
 
 ## Examples
 

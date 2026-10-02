@@ -9,7 +9,8 @@ use std::{
 };
 
 use tilcayo::kitty::{
-    probe, GraphicsTransport, KittyPresenter, Placement, TransferOptions, ZlibPolicy,
+    probe_terminal_with_events, GraphicsTransport, KittyPresenter, Placement, TransferOptions,
+    ZlibPolicy,
 };
 use tilcayo::{Frame, Rect};
 
@@ -135,18 +136,29 @@ fn fake_terminal_answers_fragmented_capability_probe() {
                     master.write_all(b";O").unwrap();
                     master.write_all(b"K\x1b\\").unwrap();
                 }
-                if command.contains("a=f") {
+                if command.contains("+q") {
+                    master
+                        .write_all(b"\x1bP1+r6b697474792d71756572792d6470695f78=313434\x1b\\")
+                        .unwrap();
+                    master
+                        .write_all(b"\x1bP1+r6b697474792d71756572792d6470695f79=313434\x1b\\")
+                        .unwrap();
                     release_receiver.recv().unwrap();
                     return;
                 }
             }
         }
     });
-    let capabilities = probe(&mut input, &mut output, std::time::Duration::from_secs(1)).unwrap();
+    let (probe, events) =
+        probe_terminal_with_events(&mut input, &mut output, std::time::Duration::from_secs(1))
+            .unwrap();
     release_sender.send(()).unwrap();
     terminal.join().unwrap();
-    assert!(capabilities.graphics);
-    assert!(capabilities.animation);
+    assert!(events.is_empty());
+    assert!(probe.graphics.graphics);
+    assert!(probe.graphics.animation);
+    assert_eq!(probe.logical_dpi.unwrap().x(), 144.0);
+    assert_eq!(probe.logical_dpi.unwrap().y(), 144.0);
 }
 
 use std::os::fd::AsRawFd;

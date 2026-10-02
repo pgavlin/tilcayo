@@ -19,7 +19,7 @@ mod runtime;
 mod session;
 mod worker;
 
-pub use capabilities::{TerminalCapabilities, TerminalSize};
+pub use capabilities::{LogicalDpi, TerminalCapabilities, TerminalSize};
 pub use clipboard::osc52;
 pub use damage::{plan_damage, DamagePolicy, Rect};
 pub use events::{
