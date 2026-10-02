@@ -118,17 +118,29 @@ fn fake_terminal_answers_fragmented_capability_probe() {
 
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     let terminal = std::thread::spawn(move || {
-        let mut query = [0; 512];
-        let count = master.read(&mut query).unwrap();
-        let query = String::from_utf8_lossy(&query[..count]);
-        let start = query.find("i=").unwrap() + 2;
-        let end = query[start..].find(',').unwrap() + start;
-        let id = &query[start..end];
-        master.write_all(b"\x1b_").unwrap();
-        master.write_all(format!("Gi={id}").as_bytes()).unwrap();
-        master.write_all(b";O").unwrap();
-        master.write_all(b"K\x1b\\").unwrap();
-        release_receiver.recv().unwrap();
+        let mut pending = Vec::new();
+        loop {
+            let mut bytes = [0; 512];
+            let count = master.read(&mut bytes).unwrap();
+            pending.extend_from_slice(&bytes[..count]);
+            while let Some(end) = pending.windows(2).position(|bytes| bytes == b"\x1b\\") {
+                let command: Vec<_> = pending.drain(..end + 2).collect();
+                let command = String::from_utf8_lossy(&command);
+                if command.contains("q=0") {
+                    let start = command.find("i=").unwrap() + 2;
+                    let end = command[start..].find(',').unwrap() + start;
+                    let id = &command[start..end];
+                    master.write_all(b"\x1b_").unwrap();
+                    master.write_all(format!("Gi={id}").as_bytes()).unwrap();
+                    master.write_all(b";O").unwrap();
+                    master.write_all(b"K\x1b\\").unwrap();
+                }
+                if command.contains("a=f") {
+                    release_receiver.recv().unwrap();
+                    return;
+                }
+            }
+        }
     });
     let capabilities = probe(&mut input, &mut output, std::time::Duration::from_secs(1)).unwrap();
     release_sender.send(()).unwrap();

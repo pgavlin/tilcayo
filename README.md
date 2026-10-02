@@ -9,10 +9,11 @@ It provides:
 
 - immutable packed-RGB frames and output-space damage rectangles;
 - damage clipping, coalescing, bounding-box reduction, and full-frame promotion;
-- a stable Kitty image updated with animation-frame rectangle replacement;
-- uncompressed POSIX shared memory for all local updates, with a temporary-file fallback;
-- direct transfer with adaptive zlib compression for remote updates;
-- isolated capability probing with fragmented-reply parsing;
+- a stable Kitty image updated with animation-frame rectangle replacement when supported;
+- full-image replacement on terminals limited to baseline Kitty graphics;
+- verified POSIX shared-memory and temporary-file transfers for local updates;
+- direct transfer with adaptive zlib compression when local media are unavailable;
+- capability probing with fragmented-reply parsing and preservation of concurrent startup input;
 - raw mode, alternate-screen, keyboard, mouse, focus, paste, and resize setup;
 - a single stoppable terminal event reader;
 - pixel-pointer mapping through the image placement;

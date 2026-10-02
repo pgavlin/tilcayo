@@ -3,7 +3,7 @@ use std::{io, sync::Arc, time::Duration};
 use crate::{
     clipboard::osc52,
     input::EventReader,
-    kitty::{probe, GraphicsCapabilities, KittyPresenter, Placement},
+    kitty::{probe_with_events, GraphicsCapabilities, KittyPresenter, Placement},
     Event, Frame, PresentationObserver, PresenterWorker, TerminalCapabilities, TerminalSession,
 };
 
@@ -55,23 +55,25 @@ impl Runtime {
         O: PresentationObserver,
     {
         let mut capabilities = TerminalCapabilities::detect()?;
-        let session = TerminalSession::enter()?;
+        let mut session = TerminalSession::enter_for_probe()?;
 
-        let graphics = if let Some(timeout) = config.probe_timeout {
+        let (graphics, pending_events) = if let Some(timeout) = config.probe_timeout {
             let mut input = io::stdin().lock();
             let mut output = io::stdout().lock();
-            probe(&mut input, &mut output, timeout)?
+            probe_with_events(&mut input, &mut output, timeout)?
         } else {
-            GraphicsCapabilities {
-                graphics: capabilities.kitty_graphics,
-                shared_memory: capabilities.kitty_graphics
-                    && std::env::var_os("SSH_CONNECTION").is_none()
-                    && std::env::var_os("TMUX").is_none()
-                    && std::env::var_os("STY").is_none(),
-                animation: capabilities.kitty_graphics,
-            }
+            (
+                GraphicsCapabilities {
+                    graphics: capabilities.kitty_graphics,
+                    shared_memory: false,
+                    temporary_file: false,
+                    animation: false,
+                },
+                Vec::new(),
+            )
         };
         capabilities.kitty_graphics = graphics.graphics;
+        capabilities.size = crate::TerminalSize::current()?;
         if config.require_graphics && !graphics.graphics {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -79,14 +81,20 @@ impl Runtime {
             ));
         }
 
+        session.enable_input()?;
         let placement = Placement::new(0, 0, capabilities.size.columns, capabilities.size.rows)?;
         let presenter = PresenterWorker::spawn_instrumented(
             io::stdout(),
-            KittyPresenter::detected(config.image_id),
+            KittyPresenter::probed(
+                config.image_id,
+                graphics.animation,
+                graphics.shared_memory,
+                graphics.temporary_file,
+            ),
             placement,
             observer,
         );
-        let input = match EventReader::spawn() {
+        let input = match EventReader::spawn_with_events(pending_events) {
             Ok(input) => input,
             Err(error) => {
                 let _ = presenter.shutdown();

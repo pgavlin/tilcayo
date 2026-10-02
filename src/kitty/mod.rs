@@ -4,7 +4,7 @@ mod transport;
 use std::io::{self, Write};
 
 use crate::{plan_damage, DamagePolicy, Frame, Rect};
-pub use probe::{probe, wait_for_ack, GraphicsCapabilities};
+pub use probe::{probe, probe_with_events, wait_for_ack, GraphicsCapabilities};
 pub use transport::{
     GraphicsTransport, TransferMedium, TransferOptions, TransferStats, TransportManager, ZlibPolicy,
 };
@@ -50,6 +50,7 @@ pub struct KittyPresenter {
     placement_id: u32,
     initialized_size: Option<(u32, u32)>,
     placement: Option<Placement>,
+    animation: bool,
     transport: TransportManager,
     transfer_options: TransferOptions,
     damage_policy: DamagePolicy,
@@ -62,6 +63,7 @@ impl KittyPresenter {
             placement_id: 1,
             initialized_size: None,
             placement: None,
+            animation: true,
             transport: TransportManager::new(local_media),
             transfer_options: TransferOptions::default(),
             damage_policy: DamagePolicy::default(),
@@ -71,6 +73,18 @@ impl KittyPresenter {
     pub fn detected(image_id: u32) -> Self {
         let mut value = Self::new(image_id, false);
         value.transport = TransportManager::detect();
+        value
+    }
+
+    pub(crate) fn probed(
+        image_id: u32,
+        animation: bool,
+        shared_memory: bool,
+        temporary_file: bool,
+    ) -> Self {
+        let mut value = Self::new(image_id, false);
+        value.animation = animation;
+        value.transport = TransportManager::probed(shared_memory, temporary_file);
         value
     }
 
@@ -84,14 +98,20 @@ impl KittyPresenter {
         frame: &Frame,
         placement: Placement,
     ) -> io::Result<PresentStats> {
-        let initialize = self.initialized_size != Some(frame.size());
-        let damage = plan_damage(
+        let size_changed = self.initialized_size != Some(frame.size());
+        let mut damage = plan_damage(
             frame.width,
             frame.height,
             frame.damage.iter().copied(),
-            initialize,
+            size_changed,
             self.damage_policy,
         );
+        // Baseline graphics has no in-place pixel update. Re-transmit and
+        // replace the stable image whenever damaged pixels must change.
+        let initialize = size_changed || (!self.animation && !damage.is_empty());
+        if initialize {
+            damage = vec![Rect::full(frame.width, frame.height)];
+        }
         if damage.is_empty() && self.placement == Some(placement) {
             return Ok(PresentStats {
                 serial: frame.serial,
@@ -286,6 +306,33 @@ mod tests {
         assert!(update.contains("a=f,r=1,i=7"));
         assert!(update.contains("a=a,q=2,c=1,i=7;"));
         assert!(!update.contains("a=T"));
+    }
+
+    #[test]
+    fn baseline_graphics_retransmits_damaged_frames() {
+        let placement = Placement::new(0, 0, 4, 2).unwrap();
+        let mut presenter = KittyPresenter::probed(7, false, false, false);
+        presenter.set_transfer_options(TransferOptions {
+            transport: GraphicsTransport::Direct,
+            zlib: ZlibPolicy::Never,
+            chunk_size: 4096,
+        });
+        presenter
+            .present(&mut Vec::new(), &frame(1, vec![]), placement)
+            .unwrap();
+
+        let mut output = Vec::new();
+        let stats = presenter
+            .present(
+                &mut output,
+                &frame(2, vec![Rect::new(1, 0, 1, 1)]),
+                placement,
+            )
+            .unwrap();
+        assert!(stats.full_frame);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("a=T"));
+        assert!(!output.contains("a=f"));
     }
 
     struct FailFlush(Vec<u8>);
