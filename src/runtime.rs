@@ -7,15 +7,29 @@ use crate::{
     Event, Frame, PresentationObserver, PresenterWorker, TerminalCapabilities, TerminalSession,
 };
 
-/// Terminal modes and graphics resources configured by [`Runtime::enter`].
+/// Configures terminal discovery and graphics resources for [`Runtime::enter`].
+///
+/// When [`Self::probe_timeout`] is set, startup actively verifies baseline
+/// graphics, local transfer media, animation updates, and logical DPI. All
+/// queries share one deadline, so the timeout bounds the probe phase as a whole
+/// rather than applying independently to each query. A longer timeout tolerates
+/// slower terminals and intermediaries but delays startup when replies are
+/// missing; a shorter timeout can produce false negatives.
+///
+/// The default configuration allows 500 milliseconds for probing, requires
+/// graphics support, and uses Kitty image identifier 1. Setting
+/// [`Self::probe_timeout`] to `None` avoids probe latency but leaves optional
+/// features disabled and infers baseline graphics support only from Kitty's
+/// environment marker. Setting [`Self::require_graphics`] to `false` permits
+/// startup after graphics detection fails, but does not provide a fallback
+/// presenter.
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeConfig {
-    /// Kitty image identifier. Zero is normalized to one.
+    /// Kitty image identifier; zero is normalized to one.
     pub image_id: u32,
-    /// Actively query Kitty graphics support for this long after entering raw mode.
-    /// Set to `None` to rely on conservative environment-based detection.
+    /// Total time allowed for all active terminal queries, or `None` to skip them.
     pub probe_timeout: Option<Duration>,
-    /// Fail startup when Kitty graphics support is not detected.
+    /// Whether startup fails if baseline Kitty graphics support is not detected.
     pub require_graphics: bool,
 }
 
@@ -46,10 +60,12 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Configures the terminal and starts input and presentation workers.
     pub fn enter(config: RuntimeConfig) -> io::Result<Self> {
         Self::enter_instrumented(config, Arc::new(()))
     }
 
+    /// Configures the runtime with a presentation observer for instrumentation.
     pub fn enter_instrumented<O>(config: RuntimeConfig, observer: Arc<O>) -> io::Result<Self>
     where
         O: PresentationObserver,
@@ -114,18 +130,24 @@ impl Runtime {
         })
     }
 
+    /// Returns the detected terminal capabilities and geometry.
     pub fn capabilities(&self) -> TerminalCapabilities {
         self.capabilities
     }
 
+    /// Returns actively verified Kitty graphics features.
     pub fn graphics_capabilities(&self) -> GraphicsCapabilities {
         self.graphics
     }
 
+    /// Returns the current image placement.
     pub fn placement(&self) -> Placement {
         self.placement
     }
 
+    /// Submits a frame without blocking on terminal output.
+    ///
+    /// Returns the frame if the presentation mailbox is closed.
     pub fn submit(&self, frame: Frame) -> Result<(), Frame> {
         self.presenter
             .as_ref()
@@ -133,6 +155,7 @@ impl Runtime {
             .submit(frame)
     }
 
+    /// Changes the placement used by subsequently presented frames.
     pub fn set_placement(&mut self, placement: Placement) {
         self.placement = placement;
         self.presenter
@@ -141,10 +164,16 @@ impl Runtime {
             .set_placement(placement);
     }
 
+    /// Queues an OSC 52 host-clipboard update.
+    ///
+    /// The caller is responsible for enforcing an appropriate size limit.
     pub fn set_clipboard(&self, bytes: &[u8]) -> io::Result<()> {
         self.write_control(osc52(bytes))
     }
 
+    /// Queues terminal control bytes on the serialized presentation thread.
+    ///
+    /// A pending control write may be replaced by a newer one.
     pub fn write_control(&self, bytes: Vec<u8>) -> io::Result<()> {
         self.presenter
             .as_ref()
@@ -177,6 +206,7 @@ impl Runtime {
             .presented_serial()
     }
 
+    /// Returns the number of pending frames replaced by newer submissions.
     pub fn dropped(&self) -> u64 {
         self.presenter
             .as_ref()
@@ -184,6 +214,7 @@ impl Runtime {
             .dropped()
     }
 
+    /// Returns a copy of the terminal-output error that stopped the presenter.
     pub fn output_error(&self) -> Option<io::Error> {
         self.presenter
             .as_ref()
@@ -191,6 +222,7 @@ impl Runtime {
             .error()
     }
 
+    /// Stops and joins workers before restoring terminal modes.
     pub fn shutdown(mut self) -> io::Result<()> {
         if let Some(mut input) = self.input.take() {
             input.shutdown()?;

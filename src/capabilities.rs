@@ -2,15 +2,21 @@ use std::io;
 
 use crossterm::terminal;
 
+/// The terminal viewport dimensions in cells and, when available, pixels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalSize {
+    /// Number of character-cell columns.
     pub columns: u16,
+    /// Number of character-cell rows.
     pub rows: u16,
+    /// Viewport width in pixels, if reported by the terminal.
     pub width_px: Option<u16>,
+    /// Viewport height in pixels, if reported by the terminal.
     pub height_px: Option<u16>,
 }
 
 impl TerminalSize {
+    /// Queries the current terminal viewport size.
     pub fn current() -> io::Result<Self> {
         let (columns, rows) = terminal::size()?;
         let pixels = terminal::window_size()
@@ -35,14 +41,18 @@ pub struct LogicalDpi {
 }
 
 impl LogicalDpi {
+    /// Creates a logical-DPI value when both axes are finite and in the
+    /// supported range of 1 through 1000 DPI.
     pub fn new(x: f64, y: f64) -> Option<Self> {
         (valid_dpi(x) && valid_dpi(y)).then_some(Self { x, y })
     }
 
+    /// Returns the horizontal logical DPI.
     pub fn x(self) -> f64 {
         self.x
     }
 
+    /// Returns the vertical logical DPI.
     pub fn y(self) -> f64 {
         self.y
     }
@@ -55,12 +65,18 @@ fn valid_dpi(value: f64) -> bool {
     value.is_finite() && (1.0..=1000.0).contains(&value)
 }
 
+/// Terminal features and geometry known to Tilcayo.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalCapabilities {
+    /// Whether Kitty graphics support was detected.
     pub kitty_graphics: bool,
+    /// Whether Kitty keyboard enhancements are supported.
     pub kitty_keyboard: bool,
+    /// Whether Tilcayo requests pixel-coordinate mouse reporting.
     pub pixel_mouse_requested: bool,
+    /// Logical DPI reported by Kitty, when actively probed.
     pub logical_dpi: Option<LogicalDpi>,
+    /// Current terminal viewport size.
     pub size: TerminalSize,
 }
 

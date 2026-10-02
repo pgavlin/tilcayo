@@ -191,6 +191,9 @@ pub struct EventReader {
 }
 
 impl EventReader {
+    /// Starts a background reader for terminal events.
+    ///
+    /// Only one reader may consume terminal input at a time.
     pub fn spawn() -> io::Result<Self> {
         Self::spawn_with_events(Vec::new())
     }
@@ -236,6 +239,7 @@ impl EventReader {
         })
     }
 
+    /// Returns the next queued event without blocking.
     pub fn try_recv(&self) -> io::Result<Option<Event>> {
         match self.receiver.try_recv() {
             Ok(Ok(event)) => Ok(Some(event)),
@@ -248,6 +252,7 @@ impl EventReader {
         }
     }
 
+    /// Blocks until the next event or input-reader error.
     pub fn recv(&self) -> io::Result<Event> {
         self.receiver.recv().map_err(|_| {
             io::Error::new(
@@ -257,6 +262,7 @@ impl EventReader {
         })?
     }
 
+    /// Requests that the reader stop and waits for its thread to exit.
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
@@ -275,6 +281,9 @@ impl Drop for EventReader {
 }
 
 /// Maps SGR-pixel coordinates through an image placement to framebuffer pixels.
+///
+/// Returns `None` when pixel geometry is unavailable, the output is empty, or
+/// the point lies outside the displayed image (including letterbox bars).
 pub fn map_pixel_pointer(
     x: u16,
     y: u16,

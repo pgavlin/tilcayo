@@ -2,10 +2,10 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use super::{Frame, Rect};
 
-/// A bounded queue containing only the newest frame not yet taken by the worker.
+/// A single-slot mailbox containing the newest frame not yet taken by the worker.
 /// Replaced frame damage is carried into the replacement frame.
 #[derive(Clone, Default)]
-pub struct LatestFrameQueue {
+pub struct LatestFrameMailbox {
     shared: Arc<(Mutex<State>, Condvar)>,
 }
 
@@ -17,16 +17,19 @@ struct State {
     dropped: u64,
 }
 
-pub(crate) enum QueueEvent {
+pub(crate) enum MailboxEvent {
     Frame(Frame),
     Wake,
     Closed,
 }
 
-impl LatestFrameQueue {
+impl LatestFrameMailbox {
+    /// Submits a frame, replacing any pending frame and preserving its damage.
+    ///
+    /// Returns the supplied frame unchanged if the mailbox is closed.
     pub fn submit(&self, mut frame: Frame) -> Result<(), Frame> {
         let (lock, ready) = &*self.shared;
-        let mut state = lock.lock().expect("latest-frame queue poisoned");
+        let mut state = lock.lock().expect("latest-frame mailbox poisoned");
         if state.closed {
             return Err(frame);
         }
@@ -44,61 +47,65 @@ impl LatestFrameQueue {
         Ok(())
     }
 
+    /// Blocks until a frame is available or the mailbox is closed.
     pub fn take(&self) -> Option<Frame> {
         loop {
             match self.take_event() {
-                QueueEvent::Frame(frame) => return Some(frame),
-                QueueEvent::Wake => {}
-                QueueEvent::Closed => return None,
+                MailboxEvent::Frame(frame) => return Some(frame),
+                MailboxEvent::Wake => {}
+                MailboxEvent::Closed => return None,
             }
         }
     }
 
-    pub(crate) fn take_event(&self) -> QueueEvent {
+    pub(crate) fn take_event(&self) -> MailboxEvent {
         let (lock, ready) = &*self.shared;
-        let mut state = lock.lock().expect("latest-frame queue poisoned");
+        let mut state = lock.lock().expect("latest-frame mailbox poisoned");
         while state.pending.is_none() && !state.wake && !state.closed {
-            state = ready.wait(state).expect("latest-frame queue poisoned");
+            state = ready.wait(state).expect("latest-frame mailbox poisoned");
         }
         if let Some(frame) = state.pending.take() {
-            QueueEvent::Frame(frame)
+            MailboxEvent::Frame(frame)
         } else if state.wake {
             state.wake = false;
-            QueueEvent::Wake
+            MailboxEvent::Wake
         } else {
-            QueueEvent::Closed
+            MailboxEvent::Closed
         }
     }
 
     pub(crate) fn wake(&self) {
         let (lock, ready) = &*self.shared;
-        let mut state = lock.lock().expect("latest-frame queue poisoned");
+        let mut state = lock.lock().expect("latest-frame mailbox poisoned");
         if !state.closed {
             state.wake = true;
             ready.notify_one();
         }
     }
 
+    /// Takes the pending frame without blocking.
     pub fn try_take(&self) -> Option<Frame> {
         self.shared
             .0
             .lock()
-            .expect("latest-frame queue poisoned")
+            .expect("latest-frame mailbox poisoned")
             .pending
             .take()
     }
 
+    /// Closes the mailbox and wakes blocked consumers.
     pub fn close(&self) {
         let (lock, ready) = &*self.shared;
-        lock.lock().expect("latest-frame queue poisoned").closed = true;
+        lock.lock().expect("latest-frame mailbox poisoned").closed = true;
         ready.notify_all();
     }
 
+    /// Returns the number of pending frames replaced by newer submissions.
     pub fn dropped(&self) -> u64 {
         self.shared
             .0
             .lock()
-            .expect("latest-frame queue poisoned")
+            .expect("latest-frame mailbox poisoned")
             .dropped
     }
 }
@@ -126,12 +133,16 @@ mod tests {
 
     #[test]
     fn replacement_is_bounded_and_preserves_damage() {
-        let queue = LatestFrameQueue::default();
-        queue.submit(frame(1, vec![Rect::new(0, 0, 1, 1)])).unwrap();
-        queue.submit(frame(2, vec![Rect::new(1, 1, 1, 1)])).unwrap();
-        let latest = queue.try_take().unwrap();
+        let mailbox = LatestFrameMailbox::default();
+        mailbox
+            .submit(frame(1, vec![Rect::new(0, 0, 1, 1)]))
+            .unwrap();
+        mailbox
+            .submit(frame(2, vec![Rect::new(1, 1, 1, 1)]))
+            .unwrap();
+        let latest = mailbox.try_take().unwrap();
         assert_eq!(latest.serial, 2);
         assert_eq!(latest.damage.len(), 2);
-        assert_eq!(queue.dropped(), 1);
+        assert_eq!(mailbox.dropped(), 1);
     }
 }

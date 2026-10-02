@@ -11,8 +11,8 @@ use std::{
 
 use crate::{
     kitty::{KittyPresenter, Placement, PresentStats},
-    queue::QueueEvent,
-    Frame, LatestFrameQueue,
+    mailbox::MailboxEvent,
+    Frame, LatestFrameMailbox,
 };
 
 /// Receives low-overhead notifications from a [`PresenterWorker`].
@@ -20,8 +20,13 @@ use crate::{
 /// Implementations must not block the presentation thread. The default `()`
 /// observer ignores all notifications.
 pub trait PresentationObserver: Send + Sync + 'static {
+    /// Called after a frame is accepted by the latest-frame mailbox.
     fn submitted(&self) {}
 
+    /// Called after a frame's complete terminal write succeeds.
+    ///
+    /// `elapsed` measures presentation work and `pipeline` measures time since
+    /// frame construction.
     fn presented(
         &self,
         _stats: PresentStats,
@@ -35,7 +40,7 @@ impl PresentationObserver for () {}
 
 /// Owns blocking terminal output on a dedicated thread.
 pub struct PresenterWorker {
-    queue: LatestFrameQueue,
+    mailbox: LatestFrameMailbox,
     error: Arc<Mutex<Option<io::Error>>>,
     presented: Arc<AtomicU64>,
     placement: Arc<Mutex<Placement>>,
@@ -45,6 +50,7 @@ pub struct PresenterWorker {
 }
 
 impl PresenterWorker {
+    /// Starts a presentation thread with no instrumentation observer.
     pub fn spawn<W>(writer: W, presenter: KittyPresenter, placement: Placement) -> Self
     where
         W: Write + Send + 'static,
@@ -52,6 +58,7 @@ impl PresenterWorker {
         Self::spawn_instrumented(writer, presenter, placement, Arc::new(()))
     }
 
+    /// Starts a presentation thread that reports activity to `observer`.
     pub fn spawn_instrumented<W, O>(
         mut writer: W,
         mut presenter: KittyPresenter,
@@ -62,8 +69,8 @@ impl PresenterWorker {
         W: Write + Send + 'static,
         O: PresentationObserver,
     {
-        let queue = LatestFrameQueue::default();
-        let worker_queue = queue.clone();
+        let mailbox = LatestFrameMailbox::default();
+        let worker_mailbox = mailbox.clone();
         let error = Arc::new(Mutex::new(None));
         let worker_error = error.clone();
         let presented = Arc::new(AtomicU64::new(0));
@@ -76,8 +83,8 @@ impl PresenterWorker {
         let thread = thread::Builder::new()
             .name("tilcayo-presenter".into())
             .spawn(move || loop {
-                let event = worker_queue.take_event();
-                let closed = matches!(event, QueueEvent::Closed);
+                let event = worker_mailbox.take_event();
+                let closed = matches!(event, MailboxEvent::Closed);
                 let result = (|| {
                     while let Some(command) = worker_commands
                         .lock()
@@ -87,7 +94,7 @@ impl PresenterWorker {
                         writer.write_all(&command)?;
                         writer.flush()?;
                     }
-                    if let QueueEvent::Frame(frame) = event {
+                    if let MailboxEvent::Frame(frame) = event {
                         let serial = frame.serial;
                         let placement = *worker_placement
                             .lock()
@@ -106,7 +113,7 @@ impl PresenterWorker {
                 })();
                 if let Err(value) = result {
                     *worker_error.lock().expect("presenter error lock poisoned") = Some(value);
-                    worker_queue.close();
+                    worker_mailbox.close();
                     break;
                 }
                 if closed {
@@ -115,7 +122,7 @@ impl PresenterWorker {
             })
             .expect("spawn presenter thread");
         Self {
-            queue,
+            mailbox,
             error,
             presented,
             placement,
@@ -125,16 +132,20 @@ impl PresenterWorker {
         }
     }
 
+    /// Submits a frame without blocking on terminal output.
+    ///
+    /// Returns the frame if the mailbox is closed.
     pub fn submit(&self, frame: Frame) -> Result<(), Frame> {
-        let result = self.queue.submit(frame);
+        let result = self.mailbox.submit(frame);
         if result.is_ok() {
             self.observer.submitted();
         }
         result
     }
 
+    /// Returns the number of pending frames replaced by newer submissions.
     pub fn dropped(&self) -> u64 {
-        self.queue.dropped()
+        self.mailbox.dropped()
     }
 
     /// Queue a bounded terminal control write on the presentation thread.
@@ -154,7 +165,7 @@ impl PresenterWorker {
         commands.clear();
         commands.push_back(bytes);
         drop(commands);
-        self.queue.wake();
+        self.mailbox.wake();
         Ok(())
     }
 
@@ -171,6 +182,7 @@ impl PresenterWorker {
         self.presented.load(Ordering::Acquire)
     }
 
+    /// Returns a copy of the output error that stopped the worker, if any.
     pub fn error(&self) -> Option<io::Error> {
         self.error
             .lock()
@@ -179,8 +191,9 @@ impl PresenterWorker {
             .map(|error| io::Error::new(error.kind(), error.to_string()))
     }
 
+    /// Closes the mailbox, joins the presentation thread, and returns its error.
     pub fn shutdown(mut self) -> io::Result<()> {
-        self.queue.close();
+        self.mailbox.close();
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
@@ -195,7 +208,7 @@ impl PresenterWorker {
 
 impl Drop for PresenterWorker {
     fn drop(&mut self) {
-        self.queue.close();
+        self.mailbox.close();
         // Do not block an unwinding compositor on terminal I/O. A normal
         // shutdown must call `shutdown`; dropping detaches the worker.
     }
@@ -250,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn slow_terminal_does_not_grow_the_queue() {
+    fn slow_terminal_does_not_grow_the_mailbox() {
         let mut presenter = KittyPresenter::new(1, false);
         presenter.set_transfer_options(TransferOptions {
             transport: GraphicsTransport::Direct,

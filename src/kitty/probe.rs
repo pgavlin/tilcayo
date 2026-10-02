@@ -25,8 +25,10 @@ use crate::{Event, KeyCode, KeyEvent, LogicalDpi, Modifiers};
 // Kitty-only parser would not remove that limitation unless Crossterm also
 // gained a public API for injecting unconsumed bytes or extending its parser.
 
+/// Kitty graphics features verified by active terminal queries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GraphicsCapabilities {
+    /// Baseline Kitty graphics commands were successfully queried.
     pub graphics: bool,
     /// POSIX shared-memory transfer was successfully queried.
     pub shared_memory: bool,
@@ -39,7 +41,9 @@ pub struct GraphicsCapabilities {
 /// Capabilities discovered during the isolated terminal probe phase.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TerminalProbe {
+    /// Actively verified Kitty graphics features.
     pub graphics: GraphicsCapabilities,
+    /// Kitty's logical DPI, when reported and valid.
     pub logical_dpi: Option<LogicalDpi>,
 }
 

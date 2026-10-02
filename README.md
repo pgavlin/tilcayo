@@ -19,7 +19,7 @@ It provides:
 - a single stoppable terminal event reader;
 - pixel-pointer mapping through the image placement;
 - OSC 52 clipboard output;
-- a bounded latest-frame queue and blocking presentation worker; and
+- a single-slot latest-frame mailbox and blocking presentation worker; and
 - terminal restoration, presentation statistics, and observer hooks.
 
 ```rust,no_run

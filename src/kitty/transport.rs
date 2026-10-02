@@ -12,32 +12,64 @@ use flate2::{write::ZlibEncoder, Compression};
 
 static NEXT_TRANSFER: AtomicU64 = AtomicU64::new(1);
 
+/// Policy for trading compression work against graphics payload size.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ZlibPolicy {
+    /// Never compress payloads, minimizing CPU work at the cost of transfer size.
     Never,
+    /// Compress non-local payloads only when the compressed result is smaller.
     Adaptive,
+    /// Always compress payloads, even when compression increases their size.
     Always,
 }
 
+/// Requested Kitty graphics transfer mechanism.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphicsTransport {
+    /// Select the best available mechanism automatically.
     Auto,
+    /// Embed base64 data directly in terminal commands.
     Direct,
+    /// Pass payloads through terminal-readable temporary files.
     TemporaryFile,
+    /// Pass payloads through POSIX shared-memory objects.
     SharedMemory,
 }
 
+/// Transfer mechanism actually used for a payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferMedium {
+    /// Base64 data embedded directly in terminal commands.
     Direct,
+    /// A terminal-readable temporary file.
     TemporaryFile,
+    /// A POSIX shared-memory object.
     SharedMemory,
 }
 
+/// Controls how Kitty graphics payloads are delivered to the terminal.
+///
+/// Transfer choice trades portability against copying and terminal-command
+/// overhead. [`GraphicsTransport::Auto`] prefers enabled shared memory, then an
+/// enabled temporary-file transport, and otherwise embeds the payload directly.
+/// Local media require the terminal to share the corresponding OS namespace;
+/// direct transfer works through remote connections and terminal multiplexers.
+///
+/// Compression reduces direct-transfer traffic at the cost of CPU time.
+/// [`ZlibPolicy::Adaptive`], the default, considers compression when no local
+/// medium is selected and keeps the compressed form only when it is smaller.
+/// The default 4096-byte chunk size is the Kitty protocol maximum and normally
+/// minimizes direct-transfer framing overhead. Smaller chunks are useful only
+/// when required by an intermediary.
 #[derive(Clone, Copy, Debug)]
 pub struct TransferOptions {
+    /// Preferred transfer mechanism, including automatic local-media selection.
     pub transport: GraphicsTransport,
+    /// Policy for trading compression work against payload size.
     pub zlib: ZlibPolicy,
+    /// Maximum base64 payload per direct-transfer command.
+    ///
+    /// Must be a nonzero multiple of four no greater than 4096.
     pub chunk_size: usize,
 }
 
@@ -51,20 +83,52 @@ impl Default for TransferOptions {
     }
 }
 
+/// Statistics for one transferred payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransferStats {
+    /// Payload bytes after optional compression and before base64 encoding.
     pub payload_bytes: usize,
+    /// Transfer mechanism used.
     pub medium: TransferMedium,
+    /// Whether the payload was zlib-compressed.
     pub compressed: bool,
 }
 
+/// Encodes and writes Kitty graphics payload transfers.
+///
+/// A transmitter records which local transfer media are eligible for automatic
+/// selection. With [`GraphicsTransport::Auto`], it prefers POSIX shared memory,
+/// then a temporary file, and otherwise embeds base64 data directly in Kitty
+/// commands.
+///
+/// Shared-memory and temporary-file transfers require the terminal process to
+/// access the same OS namespaces as the application. This is commonly false
+/// across SSH connections, containers, terminal multiplexers, and similar
+/// intermediaries. Direct transfer is slower but works through a byte stream
+/// without shared host resources.
+///
+/// Eligibility affects automatic selection only. Explicitly requesting
+/// [`GraphicsTransport::SharedMemory`] or
+/// [`GraphicsTransport::TemporaryFile`] attempts that medium regardless of how
+/// the transmitter was constructed.
+///
+/// The transmitter writes commands but does not wait for Kitty
+/// acknowledgements. A successful transfer therefore confirms only that the
+/// command was written successfully, not that the terminal accepted it.
 #[derive(Debug)]
-pub struct TransportManager {
+pub struct KittyTransmitter {
     shared_memory: bool,
     temporary_file: bool,
 }
 
-impl TransportManager {
+impl KittyTransmitter {
+    /// Creates a transmitter using conservative environment-based local-media
+    /// detection.
+    ///
+    /// Local media are enabled only when Kitty's environment marker is present
+    /// and no SSH, tmux, or GNU Screen marker is detected. This is a heuristic,
+    /// not an active capability probe. Use runtime probing when accurate
+    /// transport availability is required.
     pub fn detect() -> Self {
         let local_media = std::env::var_os("KITTY_WINDOW_ID").is_some()
             && std::env::var_os("SSH_CONNECTION").is_none()
@@ -73,6 +137,15 @@ impl TransportManager {
         Self::new(local_media)
     }
 
+    /// Creates a transmitter with the requested automatic local-media policy.
+    ///
+    /// When `local_media` is `true`, automatic selection may use both POSIX
+    /// shared memory and terminal-readable temporary files. Set it only when
+    /// the terminal shares the application's shared-memory and filesystem
+    /// namespaces.
+    ///
+    /// When `local_media` is `false`, automatic selection uses direct transfer.
+    /// Explicit local-media requests are still attempted.
     pub fn new(local_media: bool) -> Self {
         Self {
             shared_memory: local_media,
@@ -87,6 +160,27 @@ impl TransportManager {
         }
     }
 
+    /// Writes one Kitty graphics command and its payload.
+    ///
+    /// `control` supplies the Kitty command parameters preceding the payload.
+    /// `bytes` is the unencoded payload, and `animation` selects the
+    /// continuation command for direct animation-frame data. Compression,
+    /// transport selection, and direct-transfer chunking are controlled by
+    /// `options`.
+    ///
+    /// In automatic mode, failure to create shared-memory backing falls through
+    /// to an enabled temporary-file transport or direct transfer. Explicit
+    /// transport failures are returned. Once a local-media command has been
+    /// flushed successfully, ownership of deleting its backing object passes to
+    /// the terminal; failures before that point clean it up locally.
+    ///
+    /// Local-media commands are flushed before this method returns so the
+    /// terminal can acquire their backing objects. Direct commands are written
+    /// but not flushed; their caller remains responsible for flushing the
+    /// writer.
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] when the direct chunk size is
+    /// zero, greater than 4096, or not divisible by four.
     pub fn transmit(
         &mut self,
         writer: &mut impl Write,
@@ -314,9 +408,9 @@ mod tests {
 
     #[test]
     fn direct_transfer_is_chunked_and_adaptively_compressed() {
-        let mut manager = TransportManager::new(false);
+        let mut transmitter = KittyTransmitter::new(false);
         let mut output = Vec::new();
-        let stats = manager
+        let stats = transmitter
             .transmit(
                 &mut output,
                 "a=f,i=1",
@@ -332,9 +426,9 @@ mod tests {
 
     #[test]
     fn auto_uses_shared_memory_for_small_local_updates() {
-        let mut manager = TransportManager::new(true);
+        let mut transmitter = KittyTransmitter::new(true);
         let mut output = Vec::new();
-        let stats = manager
+        let stats = transmitter
             .transmit(
                 &mut output,
                 "a=f,i=1",
@@ -363,26 +457,26 @@ mod tests {
 
     #[test]
     fn invalid_chunks_are_rejected() {
-        let mut manager = TransportManager::new(false);
+        let mut transmitter = KittyTransmitter::new(false);
         let options = TransferOptions {
             chunk_size: 3,
             ..TransferOptions::default()
         };
-        assert!(manager
+        assert!(transmitter
             .transmit(&mut Vec::new(), "a=T", b"x", false, options)
             .is_err());
     }
 
     #[test]
     fn armed_transfer_objects_clean_up_on_error_paths() {
-        let mut manager = TransportManager::new(false);
-        let shm = manager.shared_payload(b"content").unwrap();
+        let mut transmitter = KittyTransmitter::new(false);
+        let shm = transmitter.shared_payload(b"content").unwrap();
         let name = shm.name.clone();
         drop(shm);
         let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         assert_eq!(fd, -1);
 
-        let temporary = manager.temporary_payload(b"content").unwrap();
+        let temporary = transmitter.temporary_payload(b"content").unwrap();
         let path = temporary.path.clone();
         assert!(path.to_string_lossy().contains("tty-graphics-protocol"));
         assert!(path.exists());
@@ -406,14 +500,14 @@ mod tests {
 
     #[test]
     fn failed_flush_removes_shared_memory() {
-        let mut manager = TransportManager::new(false);
+        let mut transmitter = KittyTransmitter::new(false);
         let mut writer = FailFlush(Vec::new());
         let options = TransferOptions {
             transport: GraphicsTransport::SharedMemory,
             zlib: ZlibPolicy::Never,
             chunk_size: 4096,
         };
-        assert!(manager
+        assert!(transmitter
             .transmit(&mut writer, "a=T", b"content", false, options)
             .is_err());
         let command = String::from_utf8(writer.0).unwrap();

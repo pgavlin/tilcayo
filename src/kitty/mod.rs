@@ -9,18 +9,24 @@ pub use probe::{
     GraphicsCapabilities, TerminalProbe,
 };
 pub use transport::{
-    GraphicsTransport, TransferMedium, TransferOptions, TransferStats, TransportManager, ZlibPolicy,
+    GraphicsTransport, KittyTransmitter, TransferMedium, TransferOptions, TransferStats, ZlibPolicy,
 };
 
+/// A Kitty image placement in terminal character cells.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Placement {
+    /// Zero-based destination column.
     pub column: u16,
+    /// Zero-based destination row.
     pub row: u16,
+    /// Placement width in cells.
     pub columns: u16,
+    /// Placement height in cells.
     pub rows: u16,
 }
 
 impl Placement {
+    /// Creates a nonempty image placement.
     pub fn new(column: u16, row: u16, columns: u16, rows: u16) -> io::Result<Self> {
         if columns == 0 || rows == 0 {
             return Err(io::Error::new(
@@ -37,16 +43,24 @@ impl Placement {
     }
 }
 
+/// Statistics for one successfully written frame presentation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PresentStats {
+    /// Serial copied from the presented [`Frame`].
     pub serial: u64,
+    /// Number of framebuffer regions transferred.
     pub regions: usize,
+    /// Total number of pixels transferred.
     pub pixels: u64,
+    /// Actual bytes written through the supplied writer.
     pub wire_bytes: usize,
+    /// Whether the entire framebuffer was transferred.
     pub full_frame: bool,
+    /// Transfer medium used by the final region, or `None` if none was sent.
     pub medium: Option<TransferMedium>,
 }
 
+/// Stateful damage-aware presenter for a stable Kitty image.
 #[derive(Debug)]
 pub struct KittyPresenter {
     image_id: u32,
@@ -54,12 +68,17 @@ pub struct KittyPresenter {
     initialized_size: Option<(u32, u32)>,
     placement: Option<Placement>,
     animation: bool,
-    transport: TransportManager,
+    transmitter: KittyTransmitter,
     transfer_options: TransferOptions,
     damage_policy: DamagePolicy,
 }
 
 impl KittyPresenter {
+    /// Creates a presenter with animation updates enabled.
+    ///
+    /// `local_media` enables shared-memory and temporary-file transports;
+    /// callers should only set it when the terminal shares the local host and
+    /// filesystem namespace. Image identifier zero is normalized to one.
     pub fn new(image_id: u32, local_media: bool) -> Self {
         Self {
             image_id: image_id.max(1),
@@ -67,15 +86,16 @@ impl KittyPresenter {
             initialized_size: None,
             placement: None,
             animation: true,
-            transport: TransportManager::new(local_media),
+            transmitter: KittyTransmitter::new(local_media),
             transfer_options: TransferOptions::default(),
             damage_policy: DamagePolicy::default(),
         }
     }
 
+    /// Creates a presenter using conservative environment-based transport detection.
     pub fn detected(image_id: u32) -> Self {
         let mut value = Self::new(image_id, false);
-        value.transport = TransportManager::detect();
+        value.transmitter = KittyTransmitter::detect();
         value
     }
 
@@ -87,14 +107,19 @@ impl KittyPresenter {
     ) -> Self {
         let mut value = Self::new(image_id, false);
         value.animation = animation;
-        value.transport = TransportManager::probed(shared_memory, temporary_file);
+        value.transmitter = KittyTransmitter::probed(shared_memory, temporary_file);
         value
     }
 
+    /// Replaces the options used for subsequent payload transfers.
     pub fn set_transfer_options(&mut self, options: TransferOptions) {
         self.transfer_options = options;
     }
 
+    /// Presents a frame at `placement`, transferring only planned damage when possible.
+    ///
+    /// Any write or flush failure invalidates cached terminal state, forcing the
+    /// next presentation to retransmit the full framebuffer.
     pub fn present(
         &mut self,
         writer: &mut impl Write,
@@ -166,7 +191,7 @@ impl KittyPresenter {
                 placement.row + 1,
                 placement.column + 1
             )?;
-            let transfer = self.transport.transmit(
+            let transfer = self.transmitter.transmit(
                 writer,
                 &format!(
                     "a=T,f=24,s={},v={},i={},p={},q=2,C=1,c={},r={}",
@@ -201,7 +226,7 @@ impl KittyPresenter {
         }
         for &rect in damage {
             let rgb = frame.region_rgb(rect)?;
-            let transfer = self.transport.transmit(
+            let transfer = self.transmitter.transmit(
                 writer,
                 &format!(
                     "a=f,r=1,i={},f=24,q=2,x={},y={},s={},v={},X=1",
@@ -221,11 +246,13 @@ impl KittyPresenter {
         Ok(stats)
     }
 
+    /// Forgets cached terminal image and placement state.
     pub fn invalidate(&mut self) {
         self.initialized_size = None;
         self.placement = None;
     }
 
+    /// Deletes the presenter's image from the terminal and invalidates local state.
     pub fn delete(&mut self, writer: &mut impl Write) -> io::Result<()> {
         write!(writer, "\x1b_Ga=d,d=I,i={},q=2;\x1b\\", self.image_id)?;
         writer.flush()?;
@@ -266,6 +293,7 @@ impl<W: Write> Write for CountingWriter<'_, W> {
     }
 }
 
+/// Writes a Kitty animation command selecting `frame` for `image_id`.
 pub fn select_frame(writer: &mut impl Write, image_id: u32, frame: u32) -> io::Result<()> {
     write!(writer, "\x1b_Ga=a,q=2,c={frame},i={image_id};\x1b\\")
 }

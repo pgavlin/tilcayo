@@ -17,6 +17,8 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
+    /// Enters raw mode and the alternate screen, hides the cursor, and enables
+    /// mouse, focus, paste, and supported keyboard-enhancement reporting.
     pub fn enter() -> io::Result<Self> {
         let mut session = Self::enter_for_probe()?;
         session.enable_input()?;

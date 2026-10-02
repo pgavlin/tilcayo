@@ -1,11 +1,13 @@
 //! A low-level GUI runtime for Kitty terminals.
 //!
 //! [`Runtime`] owns terminal session setup and restoration, capability probing,
-//! input events, and serialized graphics output. Tilcayo accepts immutable
-//! packed-RGB framebuffers, plans damaged regions, and writes Kitty graphics
-//! protocol commands using direct, temporary-file, or POSIX shared-memory
-//! transfers. Its bounded latest-frame queue prevents slow terminal output from
-//! blocking a UI event loop.
+//! input events, and serialized graphics output. Tilcayo accepts packed-RGB
+//! framebuffers, plans damaged regions, and writes Kitty graphics protocol
+//! commands using direct, temporary-file, or POSIX shared-memory transfers. Its
+//! latest-frame mailbox prevents slow terminal output from blocking a UI event
+//! loop.
+
+#![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 
 mod capabilities;
 mod clipboard;
@@ -13,8 +15,9 @@ mod damage;
 mod events;
 mod frame;
 mod input;
+/// Kitty graphics protocol probing, transport, and presentation.
 pub mod kitty;
-mod queue;
+mod mailbox;
 mod runtime;
 mod session;
 mod worker;
@@ -29,7 +32,7 @@ pub use events::{
 pub use frame::Frame;
 pub use input::{map_pixel_pointer, EventReader};
 pub use kitty::Placement;
-pub use queue::LatestFrameQueue;
+pub use mailbox::LatestFrameMailbox;
 pub use runtime::{Runtime, RuntimeConfig};
 pub use session::TerminalSession;
 pub use worker::{PresentationObserver, PresenterWorker};
