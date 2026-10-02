@@ -60,7 +60,8 @@ pub struct TransferStats {
 
 #[derive(Debug)]
 pub struct TransportManager {
-    local_media: bool,
+    shared_memory: bool,
+    temporary_file: bool,
 }
 
 impl TransportManager {
@@ -69,11 +70,21 @@ impl TransportManager {
             && std::env::var_os("SSH_CONNECTION").is_none()
             && std::env::var_os("TMUX").is_none()
             && std::env::var_os("STY").is_none();
-        Self { local_media }
+        Self::new(local_media)
     }
 
     pub fn new(local_media: bool) -> Self {
-        Self { local_media }
+        Self {
+            shared_memory: local_media,
+            temporary_file: local_media,
+        }
+    }
+
+    pub(crate) fn probed(shared_memory: bool, temporary_file: bool) -> Self {
+        Self {
+            shared_memory,
+            temporary_file,
+        }
     }
 
     pub fn transmit(
@@ -90,8 +101,10 @@ impl TransportManager {
                 "Kitty chunks must be a nonzero multiple of four at most 4096 bytes",
             ));
         }
-        let auto_local = options.transport == GraphicsTransport::Auto && self.local_media;
-        let local = auto_local
+        let auto_shared = options.transport == GraphicsTransport::Auto && self.shared_memory;
+        let auto_temporary = options.transport == GraphicsTransport::Auto && self.temporary_file;
+        let local = auto_shared
+            || auto_temporary
             || matches!(
                 options.transport,
                 GraphicsTransport::TemporaryFile | GraphicsTransport::SharedMemory
@@ -117,7 +130,7 @@ impl TransportManager {
         };
         let compression = if use_compressed { ",o=z" } else { "" };
 
-        if options.transport == GraphicsTransport::SharedMemory || auto_local {
+        if options.transport == GraphicsTransport::SharedMemory || auto_shared {
             match self.shared_payload(payload) {
                 Ok(mut object) => {
                     let name =
@@ -142,7 +155,7 @@ impl TransportManager {
             }
         }
 
-        if options.transport == GraphicsTransport::TemporaryFile || auto_local {
+        if options.transport == GraphicsTransport::TemporaryFile || auto_temporary {
             let mut object = self.temporary_payload(payload)?;
             let path = base64::engine::general_purpose::STANDARD
                 .encode(object.path.as_os_str().as_encoded_bytes());

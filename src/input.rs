@@ -56,7 +56,16 @@ pub struct EventReader {
 
 impl EventReader {
     pub fn spawn() -> io::Result<Self> {
+        Self::spawn_with_events(Vec::new())
+    }
+
+    pub(crate) fn spawn_with_events(initial: Vec<Event>) -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel();
+        for event in initial {
+            sender.send(Ok(event)).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "terminal event queue closed")
+            })?;
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let thread = thread::Builder::new()
