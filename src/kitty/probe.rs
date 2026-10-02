@@ -330,12 +330,35 @@ impl ProbeShm {
                 }
                 return Err(error);
             }
-            let mut file = unsafe { File::from_raw_fd(fd) };
-            if let Err(error) = file.write_all(bytes).and_then(|_| file.flush()) {
-                unsafe { libc::shm_unlink(name.as_ptr()) };
-                return Err(error);
+            let file = unsafe { File::from_raw_fd(fd) };
+            let object = Self { name };
+            file.set_len(bytes.len() as u64)?;
+            if bytes.is_empty() {
+                return Ok(object);
             }
-            return Ok(Self { name });
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes.len(),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if mapping == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapping.cast(), bytes.len());
+                if libc::msync(mapping, bytes.len(), libc::MS_SYNC) != 0 {
+                    let error = io::Error::last_os_error();
+                    libc::munmap(mapping, bytes.len());
+                    return Err(error);
+                }
+                libc::munmap(mapping, bytes.len());
+            }
+            return Ok(object);
         }
     }
 }
@@ -638,6 +661,15 @@ fn response_for(action: &Action, id: u32) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creates_sized_shared_memory_probe_payload() {
+        let object = ProbeShm::new(b"rgb").unwrap();
+        let fd = unsafe { libc::shm_open(object.name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(fd >= 0);
+        let file = unsafe { File::from_raw_fd(fd) };
+        assert!(file.metadata().unwrap().len() >= 3);
+    }
 
     #[test]
     fn maintained_parser_handles_fragmented_kitty_reply() {
