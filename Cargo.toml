@@ -1,0 +1,17 @@
+[package]
+name = "tilcayo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A damage-aware framebuffer presentation pipeline for the Kitty graphics protocol"
+license = "MIT"
+repository = "https://github.com/pgavlin/tilcayo"
+keywords = ["kitty", "terminal", "graphics", "framebuffer"]
+categories = ["graphics", "command-line-interface"]
+
+[dependencies]
+base64 = "0.22"
+crossterm = "0.28"
+flate2 = "1"
+libc = "0.2"
+termwiz = "0.23.3"
