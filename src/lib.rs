@@ -10,6 +10,7 @@
 mod capabilities;
 mod clipboard;
 mod damage;
+mod events;
 mod frame;
 mod input;
 pub mod kitty;
@@ -21,8 +22,12 @@ mod worker;
 pub use capabilities::{TerminalCapabilities, TerminalSize};
 pub use clipboard::osc52;
 pub use damage::{plan_damage, DamagePolicy, Rect};
+pub use events::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, MediaKeyCode, ModifierKeyCode,
+    Modifiers, PointerButton, PointerEvent, PointerEventKind,
+};
 pub use frame::Frame;
-pub use input::{adapt, map_pixel_pointer, Event, EventReader};
+pub use input::{map_pixel_pointer, EventReader};
 pub use kitty::Placement;
 pub use queue::LatestFrameQueue;
 pub use runtime::{Runtime, RuntimeConfig};

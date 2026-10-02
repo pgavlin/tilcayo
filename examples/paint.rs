@@ -1,8 +1,8 @@
 use std::{io, sync::Arc, thread, time::Duration};
 
-use crossterm::event::{KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use tilcayo::{
-    map_pixel_pointer, Event, Frame, Placement, Rect, Runtime, RuntimeConfig, TerminalSize,
+    map_pixel_pointer, Event, Frame, KeyCode, KeyEventKind, Placement, PointerButton, PointerEvent,
+    PointerEventKind, Rect, Runtime, RuntimeConfig, TerminalSize,
 };
 
 fn main() -> io::Result<()> {
@@ -85,26 +85,26 @@ fn run(runtime: &mut Runtime) -> io::Result<()> {
 }
 
 fn pointer_stroke(
-    event: MouseEvent,
+    event: PointerEvent,
     painting: &mut bool,
     terminal: TerminalSize,
     placement: Placement,
     output: (u32, u32),
 ) -> Option<(Rect, (u32, u32), [u8; 3])> {
     let button = match event.kind {
-        MouseEventKind::Down(button) => {
+        PointerEventKind::Down(button) => {
             *painting = true;
             button
         }
-        MouseEventKind::Drag(button) => {
+        PointerEventKind::Drag(button) => {
             *painting = true;
             button
         }
-        MouseEventKind::Up(_) => {
+        PointerEventKind::Up(_) => {
             *painting = false;
             return None;
         }
-        MouseEventKind::Moved if *painting => MouseButton::Left,
+        PointerEventKind::Moved if *painting => PointerButton::Left,
         _ => return None,
     };
     let (x, y) = pointer_position(event, terminal, placement, output)?;
@@ -117,26 +117,26 @@ fn pointer_stroke(
     )
     .clip(output.0, output.1)?;
     let color = match button {
-        MouseButton::Left => [255, 80, 70],
-        MouseButton::Right => [70, 150, 255],
-        MouseButton::Middle => [255, 220, 70],
+        PointerButton::Left => [255, 80, 70],
+        PointerButton::Right => [70, 150, 255],
+        PointerButton::Middle => [255, 220, 70],
+        PointerButton::Other(_) => [220, 220, 220],
     };
     Some((damage, (x, y), color))
 }
 
 fn pointer_position(
-    event: MouseEvent,
+    event: PointerEvent,
     terminal: TerminalSize,
     placement: Placement,
     output: (u32, u32),
 ) -> Option<(u32, u32)> {
-    let position = map_pixel_pointer(event.column, event.row, terminal, placement, output)
-        .or_else(|| {
+    let position =
+        map_pixel_pointer(event.x, event.y, terminal, placement, output).or_else(|| {
             (terminal.width_px.is_none() || terminal.height_px.is_none()).then(|| {
                 (
-                    f64::from(event.column) * f64::from(output.0)
-                        / f64::from(terminal.columns.max(1)),
-                    f64::from(event.row) * f64::from(output.1) / f64::from(terminal.rows.max(1)),
+                    f64::from(event.x) * f64::from(output.0) / f64::from(terminal.columns.max(1)),
+                    f64::from(event.y) * f64::from(output.1) / f64::from(terminal.rows.max(1)),
                 )
             })
         })?;

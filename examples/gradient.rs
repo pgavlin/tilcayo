@@ -1,7 +1,8 @@
 use std::{io, sync::Arc, thread, time::Duration};
 
-use crossterm::event::{KeyCode, KeyEventKind};
-use tilcayo::{Event, Frame, Placement, Rect, Runtime, RuntimeConfig, TerminalSize};
+use tilcayo::{
+    Event, Frame, KeyCode, KeyEventKind, Placement, Rect, Runtime, RuntimeConfig, TerminalSize,
+};
 
 fn main() -> io::Result<()> {
     let mut runtime = Runtime::enter(RuntimeConfig::default())?;

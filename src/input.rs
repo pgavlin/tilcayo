@@ -8,25 +8,29 @@ use std::{
     time::Duration,
 };
 
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, MouseEvent};
+use crossterm::event::{
+    self, Event as CrosstermEvent, KeyCode as CrosstermKeyCode,
+    KeyEventKind as CrosstermKeyEventKind, KeyEventState as CrosstermKeyEventState,
+    KeyModifiers as CrosstermModifiers, MediaKeyCode as CrosstermMediaKeyCode,
+    ModifierKeyCode as CrosstermModifierKeyCode, MouseButton as CrosstermMouseButton,
+    MouseEventKind as CrosstermMouseEventKind,
+};
 
-use crate::{kitty::Placement, TerminalSize};
-
-/// An input or geometry event produced by the host terminal.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Event {
-    Key(KeyEvent),
-    Pointer(MouseEvent),
-    Focus(bool),
-    Resize(TerminalSize),
-    Paste(String),
-}
+use crate::{
+    kitty::Placement, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, MediaKeyCode,
+    ModifierKeyCode, Modifiers, PointerButton, PointerEvent, PointerEventKind, TerminalSize,
+};
 
 /// Adapts one Crossterm event into Tilcayo's runtime event type.
-pub fn adapt(event: CrosstermEvent) -> io::Result<Option<Event>> {
+pub(crate) fn adapt(event: CrosstermEvent) -> io::Result<Option<Event>> {
     Ok(match event {
-        CrosstermEvent::Key(value) => Some(Event::Key(value)),
-        CrosstermEvent::Mouse(value) => Some(Event::Pointer(value)),
+        CrosstermEvent::Key(value) => Some(Event::Key(adapt_key(value))),
+        CrosstermEvent::Mouse(value) => Some(Event::Pointer(PointerEvent {
+            kind: adapt_pointer_kind(value.kind),
+            x: value.column,
+            y: value.row,
+            modifiers: adapt_modifiers(value.modifiers),
+        })),
         CrosstermEvent::FocusGained => Some(Event::Focus(true)),
         CrosstermEvent::FocusLost => Some(Event::Focus(false)),
         CrosstermEvent::Resize(columns, rows) => {
@@ -42,6 +46,138 @@ pub fn adapt(event: CrosstermEvent) -> io::Result<Option<Event>> {
         }
         CrosstermEvent::Paste(value) => Some(Event::Paste(value)),
     })
+}
+
+fn adapt_key(value: crossterm::event::KeyEvent) -> KeyEvent {
+    KeyEvent {
+        code: adapt_key_code(value.code),
+        modifiers: adapt_modifiers(value.modifiers),
+        kind: match value.kind {
+            CrosstermKeyEventKind::Press => KeyEventKind::Press,
+            CrosstermKeyEventKind::Repeat => KeyEventKind::Repeat,
+            CrosstermKeyEventKind::Release => KeyEventKind::Release,
+        },
+        state: adapt_key_state(value.state),
+    }
+}
+
+fn adapt_key_code(value: CrosstermKeyCode) -> KeyCode {
+    match value {
+        CrosstermKeyCode::Backspace => KeyCode::Backspace,
+        CrosstermKeyCode::Enter => KeyCode::Enter,
+        CrosstermKeyCode::Left => KeyCode::Left,
+        CrosstermKeyCode::Right => KeyCode::Right,
+        CrosstermKeyCode::Up => KeyCode::Up,
+        CrosstermKeyCode::Down => KeyCode::Down,
+        CrosstermKeyCode::Home => KeyCode::Home,
+        CrosstermKeyCode::End => KeyCode::End,
+        CrosstermKeyCode::PageUp => KeyCode::PageUp,
+        CrosstermKeyCode::PageDown => KeyCode::PageDown,
+        CrosstermKeyCode::Tab => KeyCode::Tab,
+        CrosstermKeyCode::BackTab => KeyCode::BackTab,
+        CrosstermKeyCode::Delete => KeyCode::Delete,
+        CrosstermKeyCode::Insert => KeyCode::Insert,
+        CrosstermKeyCode::F(number) => KeyCode::F(number),
+        CrosstermKeyCode::Char(character) => KeyCode::Char(character),
+        CrosstermKeyCode::Null => KeyCode::Null,
+        CrosstermKeyCode::Esc => KeyCode::Esc,
+        CrosstermKeyCode::CapsLock => KeyCode::CapsLock,
+        CrosstermKeyCode::ScrollLock => KeyCode::ScrollLock,
+        CrosstermKeyCode::NumLock => KeyCode::NumLock,
+        CrosstermKeyCode::PrintScreen => KeyCode::PrintScreen,
+        CrosstermKeyCode::Pause => KeyCode::Pause,
+        CrosstermKeyCode::Menu => KeyCode::Menu,
+        CrosstermKeyCode::KeypadBegin => KeyCode::KeypadBegin,
+        CrosstermKeyCode::Media(value) => KeyCode::Media(match value {
+            CrosstermMediaKeyCode::Play => MediaKeyCode::Play,
+            CrosstermMediaKeyCode::Pause => MediaKeyCode::Pause,
+            CrosstermMediaKeyCode::PlayPause => MediaKeyCode::PlayPause,
+            CrosstermMediaKeyCode::Reverse => MediaKeyCode::Reverse,
+            CrosstermMediaKeyCode::Stop => MediaKeyCode::Stop,
+            CrosstermMediaKeyCode::FastForward => MediaKeyCode::FastForward,
+            CrosstermMediaKeyCode::Rewind => MediaKeyCode::Rewind,
+            CrosstermMediaKeyCode::TrackNext => MediaKeyCode::TrackNext,
+            CrosstermMediaKeyCode::TrackPrevious => MediaKeyCode::TrackPrevious,
+            CrosstermMediaKeyCode::Record => MediaKeyCode::Record,
+            CrosstermMediaKeyCode::LowerVolume => MediaKeyCode::LowerVolume,
+            CrosstermMediaKeyCode::RaiseVolume => MediaKeyCode::RaiseVolume,
+            CrosstermMediaKeyCode::MuteVolume => MediaKeyCode::MuteVolume,
+        }),
+        CrosstermKeyCode::Modifier(value) => KeyCode::Modifier(match value {
+            CrosstermModifierKeyCode::LeftShift => ModifierKeyCode::LeftShift,
+            CrosstermModifierKeyCode::LeftControl => ModifierKeyCode::LeftControl,
+            CrosstermModifierKeyCode::LeftAlt => ModifierKeyCode::LeftAlt,
+            CrosstermModifierKeyCode::LeftSuper => ModifierKeyCode::LeftSuper,
+            CrosstermModifierKeyCode::LeftHyper => ModifierKeyCode::LeftHyper,
+            CrosstermModifierKeyCode::LeftMeta => ModifierKeyCode::LeftMeta,
+            CrosstermModifierKeyCode::RightShift => ModifierKeyCode::RightShift,
+            CrosstermModifierKeyCode::RightControl => ModifierKeyCode::RightControl,
+            CrosstermModifierKeyCode::RightAlt => ModifierKeyCode::RightAlt,
+            CrosstermModifierKeyCode::RightSuper => ModifierKeyCode::RightSuper,
+            CrosstermModifierKeyCode::RightHyper => ModifierKeyCode::RightHyper,
+            CrosstermModifierKeyCode::RightMeta => ModifierKeyCode::RightMeta,
+            CrosstermModifierKeyCode::IsoLevel3Shift => ModifierKeyCode::IsoLevel3Shift,
+            CrosstermModifierKeyCode::IsoLevel5Shift => ModifierKeyCode::IsoLevel5Shift,
+        }),
+    }
+}
+
+fn adapt_modifiers(value: CrosstermModifiers) -> Modifiers {
+    let mut result = Modifiers::NONE;
+    if value.contains(CrosstermModifiers::SHIFT) {
+        result |= Modifiers::SHIFT;
+    }
+    if value.contains(CrosstermModifiers::CONTROL) {
+        result |= Modifiers::CONTROL;
+    }
+    if value.contains(CrosstermModifiers::ALT) {
+        result |= Modifiers::ALT;
+    }
+    if value.contains(CrosstermModifiers::SUPER) {
+        result |= Modifiers::SUPER;
+    }
+    if value.contains(CrosstermModifiers::HYPER) {
+        result |= Modifiers::HYPER;
+    }
+    if value.contains(CrosstermModifiers::META) {
+        result |= Modifiers::META;
+    }
+    result
+}
+
+fn adapt_key_state(value: CrosstermKeyEventState) -> KeyEventState {
+    let mut result = KeyEventState::NONE;
+    if value.contains(CrosstermKeyEventState::KEYPAD) {
+        result |= KeyEventState::KEYPAD;
+    }
+    if value.contains(CrosstermKeyEventState::CAPS_LOCK) {
+        result |= KeyEventState::CAPS_LOCK;
+    }
+    if value.contains(CrosstermKeyEventState::NUM_LOCK) {
+        result |= KeyEventState::NUM_LOCK;
+    }
+    result
+}
+
+fn adapt_pointer_kind(value: CrosstermMouseEventKind) -> PointerEventKind {
+    match value {
+        CrosstermMouseEventKind::Down(button) => PointerEventKind::Down(adapt_button(button)),
+        CrosstermMouseEventKind::Up(button) => PointerEventKind::Up(adapt_button(button)),
+        CrosstermMouseEventKind::Drag(button) => PointerEventKind::Drag(adapt_button(button)),
+        CrosstermMouseEventKind::Moved => PointerEventKind::Moved,
+        CrosstermMouseEventKind::ScrollDown => PointerEventKind::ScrollDown,
+        CrosstermMouseEventKind::ScrollUp => PointerEventKind::ScrollUp,
+        CrosstermMouseEventKind::ScrollLeft => PointerEventKind::ScrollLeft,
+        CrosstermMouseEventKind::ScrollRight => PointerEventKind::ScrollRight,
+    }
+}
+
+fn adapt_button(value: CrosstermMouseButton) -> PointerButton {
+    match value {
+        CrosstermMouseButton::Left => PointerButton::Left,
+        CrosstermMouseButton::Right => PointerButton::Right,
+        CrosstermMouseButton::Middle => PointerButton::Middle,
+    }
 }
 
 /// The sole terminal-input consumer used by [`crate::Runtime`].
@@ -179,6 +315,41 @@ pub fn map_pixel_pointer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapts_crossterm_events_to_owned_types() {
+        let key = crossterm::event::KeyEvent::new_with_kind_and_state(
+            CrosstermKeyCode::Char('x'),
+            CrosstermModifiers::CONTROL | CrosstermModifiers::ALT,
+            CrosstermKeyEventKind::Repeat,
+            CrosstermKeyEventState::CAPS_LOCK,
+        );
+        assert_eq!(
+            adapt(CrosstermEvent::Key(key)).unwrap(),
+            Some(Event::Key(KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: Modifiers::CONTROL | Modifiers::ALT,
+                kind: KeyEventKind::Repeat,
+                state: KeyEventState::CAPS_LOCK,
+            }))
+        );
+
+        let pointer = crossterm::event::MouseEvent {
+            kind: CrosstermMouseEventKind::Drag(CrosstermMouseButton::Left),
+            column: 12,
+            row: 34,
+            modifiers: CrosstermModifiers::SHIFT,
+        };
+        assert_eq!(
+            adapt(CrosstermEvent::Mouse(pointer)).unwrap(),
+            Some(Event::Pointer(PointerEvent {
+                kind: PointerEventKind::Drag(PointerButton::Left),
+                x: 12,
+                y: 34,
+                modifiers: Modifiers::SHIFT,
+            }))
+        );
+    }
 
     #[test]
     fn maps_and_rejects_pixel_mouse_coordinates() {

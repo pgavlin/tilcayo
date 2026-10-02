@@ -8,13 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::event::{KeyCode as CrosstermKeyCode, KeyEvent, KeyModifiers};
 use termwiz::{
     escape::{apc::KittyImageData, parser::Parser, Action, KittyImage},
-    input::{InputEvent, InputParser, KeyCode as TermwizKeyCode, Modifiers},
+    input::{InputEvent, InputParser, KeyCode as TermwizKeyCode, Modifiers as TermwizModifiers},
 };
 
-use crate::Event;
+use crate::{Event, KeyCode, KeyEvent, Modifiers};
 
 // Runtime input ownership is deliberately phased. During this module's probe,
 // advanced terminal input modes are still disabled and Termwiz parses both
@@ -413,38 +412,36 @@ fn adapt_probe_input(event: InputEvent) -> Option<Event> {
         return None;
     };
     let code = match key.key {
-        TermwizKeyCode::Char(value) => CrosstermKeyCode::Char(value),
-        TermwizKeyCode::Backspace => CrosstermKeyCode::Backspace,
-        TermwizKeyCode::Enter => CrosstermKeyCode::Enter,
-        TermwizKeyCode::LeftArrow | TermwizKeyCode::ApplicationLeftArrow => CrosstermKeyCode::Left,
-        TermwizKeyCode::RightArrow | TermwizKeyCode::ApplicationRightArrow => {
-            CrosstermKeyCode::Right
-        }
-        TermwizKeyCode::UpArrow | TermwizKeyCode::ApplicationUpArrow => CrosstermKeyCode::Up,
-        TermwizKeyCode::DownArrow | TermwizKeyCode::ApplicationDownArrow => CrosstermKeyCode::Down,
-        TermwizKeyCode::Home | TermwizKeyCode::KeyPadHome => CrosstermKeyCode::Home,
-        TermwizKeyCode::End | TermwizKeyCode::KeyPadEnd => CrosstermKeyCode::End,
-        TermwizKeyCode::PageUp | TermwizKeyCode::KeyPadPageUp => CrosstermKeyCode::PageUp,
-        TermwizKeyCode::PageDown | TermwizKeyCode::KeyPadPageDown => CrosstermKeyCode::PageDown,
-        TermwizKeyCode::Tab => CrosstermKeyCode::Tab,
-        TermwizKeyCode::Delete => CrosstermKeyCode::Delete,
-        TermwizKeyCode::Insert => CrosstermKeyCode::Insert,
-        TermwizKeyCode::Function(number) => CrosstermKeyCode::F(number),
-        TermwizKeyCode::Escape => CrosstermKeyCode::Esc,
+        TermwizKeyCode::Char(value) => KeyCode::Char(value),
+        TermwizKeyCode::Backspace => KeyCode::Backspace,
+        TermwizKeyCode::Enter => KeyCode::Enter,
+        TermwizKeyCode::LeftArrow | TermwizKeyCode::ApplicationLeftArrow => KeyCode::Left,
+        TermwizKeyCode::RightArrow | TermwizKeyCode::ApplicationRightArrow => KeyCode::Right,
+        TermwizKeyCode::UpArrow | TermwizKeyCode::ApplicationUpArrow => KeyCode::Up,
+        TermwizKeyCode::DownArrow | TermwizKeyCode::ApplicationDownArrow => KeyCode::Down,
+        TermwizKeyCode::Home | TermwizKeyCode::KeyPadHome => KeyCode::Home,
+        TermwizKeyCode::End | TermwizKeyCode::KeyPadEnd => KeyCode::End,
+        TermwizKeyCode::PageUp | TermwizKeyCode::KeyPadPageUp => KeyCode::PageUp,
+        TermwizKeyCode::PageDown | TermwizKeyCode::KeyPadPageDown => KeyCode::PageDown,
+        TermwizKeyCode::Tab => KeyCode::Tab,
+        TermwizKeyCode::Delete => KeyCode::Delete,
+        TermwizKeyCode::Insert => KeyCode::Insert,
+        TermwizKeyCode::Function(number) => KeyCode::F(number),
+        TermwizKeyCode::Escape => KeyCode::Esc,
         _ => return None,
     };
-    let mut modifiers = KeyModifiers::empty();
-    if key.modifiers.contains(Modifiers::SHIFT) {
-        modifiers |= KeyModifiers::SHIFT;
+    let mut modifiers = Modifiers::NONE;
+    if key.modifiers.contains(TermwizModifiers::SHIFT) {
+        modifiers |= Modifiers::SHIFT;
     }
-    if key.modifiers.contains(Modifiers::ALT) {
-        modifiers |= KeyModifiers::ALT;
+    if key.modifiers.contains(TermwizModifiers::ALT) {
+        modifiers |= Modifiers::ALT;
     }
-    if key.modifiers.contains(Modifiers::CTRL) {
-        modifiers |= KeyModifiers::CONTROL;
+    if key.modifiers.contains(TermwizModifiers::CTRL) {
+        modifiers |= Modifiers::CONTROL;
     }
-    if key.modifiers.contains(Modifiers::SUPER) {
-        modifiers |= KeyModifiers::SUPER;
+    if key.modifiers.contains(TermwizModifiers::SUPER) {
+        modifiers |= Modifiers::SUPER;
     }
     Some(Event::Key(KeyEvent::new(code, modifiers)))
 }
@@ -502,14 +499,8 @@ mod tests {
         assert_eq!(
             decoder.finish(),
             vec![
-                Event::Key(KeyEvent::new(
-                    CrosstermKeyCode::Char('q'),
-                    KeyModifiers::empty()
-                )),
-                Event::Key(KeyEvent::new(
-                    CrosstermKeyCode::Char('x'),
-                    KeyModifiers::empty()
-                ))
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), Modifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), Modifiers::NONE))
             ]
         );
     }
