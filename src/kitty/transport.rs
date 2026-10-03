@@ -378,6 +378,12 @@ impl KittyTransmitter {
     }
 }
 
+// Avoid a full zlib pass over large, high-entropy framebuffers. Four evenly
+// spaced 4 KiB windows are fed into one fast zlib stream; any size reduction
+// permits the normal full compression attempt. A false positive only costs
+// compression time because the caller still rejects an oversized final result,
+// while a false negative conservatively sends the original bytes. Small
+// payloads skip sampling because a full trial is inexpensive.
 fn adaptive_sample_compresses(bytes: &[u8]) -> io::Result<bool> {
     if bytes.len() <= ADAPTIVE_SAMPLE_THRESHOLD {
         return Ok(true);
