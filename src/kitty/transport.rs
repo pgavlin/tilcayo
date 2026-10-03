@@ -337,12 +337,9 @@ impl KittyTransmitter {
                 return Err(io::Error::last_os_error());
             }
             unsafe {
+                // MAP_SHARED writes are immediately visible to other mappings;
+                // msync is only needed to synchronize file-backed storage.
                 std::ptr::copy_nonoverlapping(payload.as_ptr(), mapping.cast(), payload.len());
-                if libc::msync(mapping, payload.len(), libc::MS_SYNC) != 0 {
-                    let error = io::Error::last_os_error();
-                    libc::munmap(mapping, payload.len());
-                    return Err(error);
-                }
                 libc::munmap(mapping, payload.len());
             }
             object.armed = true;
@@ -460,6 +457,23 @@ mod tests {
             .decode(encoded)
             .unwrap();
         let name = CString::new(name).unwrap();
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(fd >= 0);
+        let file = unsafe { File::from_raw_fd(fd) };
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                768,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        let payload = unsafe { std::slice::from_raw_parts(mapping.cast::<u8>(), 768) };
+        assert_eq!(payload, &[0xa5; 768]);
+        assert_eq!(unsafe { libc::munmap(mapping, 768) }, 0);
         assert_eq!(unsafe { libc::shm_unlink(name.as_ptr()) }, 0);
     }
 
