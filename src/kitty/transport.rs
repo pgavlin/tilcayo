@@ -124,6 +124,10 @@ pub struct TransferStats {
 pub struct KittyTransmitter {
     shared_memory: bool,
     temporary_file: bool,
+    #[cfg(test)]
+    fail_shared_memory: bool,
+    #[cfg(test)]
+    fail_temporary_file: bool,
 }
 
 impl KittyTransmitter {
@@ -155,6 +159,10 @@ impl KittyTransmitter {
         Self {
             shared_memory: local_media,
             temporary_file: local_media,
+            #[cfg(test)]
+            fail_shared_memory: false,
+            #[cfg(test)]
+            fail_temporary_file: false,
         }
     }
 
@@ -162,6 +170,10 @@ impl KittyTransmitter {
         Self {
             shared_memory,
             temporary_file,
+            #[cfg(test)]
+            fail_shared_memory: false,
+            #[cfg(test)]
+            fail_temporary_file: false,
         }
     }
 
@@ -192,8 +204,8 @@ impl KittyTransmitter {
     /// but not flushed; their caller remains responsible for flushing the
     /// writer.
     ///
-    /// Returns [`io::ErrorKind::InvalidInput`] when the direct chunk size is
-    /// zero, greater than 4096, or not divisible by four.
+    /// Returns [`io::ErrorKind::InvalidInput`] when `bytes` is empty or the
+    /// direct chunk size is zero, greater than 4096, or not divisible by four.
     pub fn transmit(
         &mut self,
         writer: &mut impl Write,
@@ -202,6 +214,12 @@ impl KittyTransmitter {
         animation: bool,
         options: TransferOptions,
     ) -> io::Result<TransferStats> {
+        if bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Kitty graphics payloads must be nonempty",
+            ));
+        }
         if options.chunk_size == 0 || options.chunk_size > 4096 || options.chunk_size % 4 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -265,21 +283,28 @@ impl KittyTransmitter {
         }
 
         if options.transport == GraphicsTransport::TemporaryFile || auto_temporary {
-            let mut object = self.temporary_payload(payload)?;
-            let path = base64::engine::general_purpose::STANDARD
-                .encode(object.path.as_os_str().as_encoded_bytes());
-            write!(
-                writer,
-                "\x1b_G{control}{compression},t=t,S={};{path}\x1b\\",
-                payload.len()
-            )?;
-            writer.flush()?;
-            object.disarm(); // Kitty deletes t=t files after reading them.
-            return Ok(TransferStats {
-                payload_bytes: payload.len(),
-                medium: TransferMedium::TemporaryFile,
-                compressed: use_compressed,
-            });
+            match self.temporary_payload(payload) {
+                Ok(mut object) => {
+                    let path = base64::engine::general_purpose::STANDARD
+                        .encode(object.path.as_os_str().as_encoded_bytes());
+                    write!(
+                        writer,
+                        "\x1b_G{control}{compression},t=t,S={};{path}\x1b\\",
+                        payload.len()
+                    )?;
+                    writer.flush()?;
+                    object.disarm(); // Kitty deletes t=t files after reading them.
+                    return Ok(TransferStats {
+                        payload_bytes: payload.len(),
+                        medium: TransferMedium::TemporaryFile,
+                        compressed: use_compressed,
+                    });
+                }
+                Err(error) if options.transport == GraphicsTransport::TemporaryFile => {
+                    return Err(error)
+                }
+                Err(_) => {}
+            }
         }
 
         let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
@@ -303,6 +328,13 @@ impl KittyTransmitter {
     }
 
     fn shared_payload(&mut self, payload: &[u8]) -> io::Result<ShmObject> {
+        #[cfg(test)]
+        if self.fail_shared_memory {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected shared-memory failure",
+            ));
+        }
         loop {
             let name = CString::new(format!(
                 "/tilcayo-gfx-{:x}-{:x}",
@@ -355,6 +387,13 @@ impl KittyTransmitter {
     }
 
     fn temporary_payload(&mut self, payload: &[u8]) -> io::Result<TemporaryObject> {
+        #[cfg(test)]
+        if self.fail_temporary_file {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected temporary-file failure",
+            ));
+        }
         loop {
             // The protocol only permits terminals to delete temporary files
             // whose paths contain this marker.
@@ -520,6 +559,61 @@ mod tests {
         assert_eq!(payload, &[0xa5; 768]);
         assert_eq!(unsafe { libc::munmap(mapping, 768) }, 0);
         assert_eq!(unsafe { libc::shm_unlink(name.as_ptr()) }, 0);
+    }
+
+    #[test]
+    fn auto_falls_back_to_direct_when_local_media_fail() {
+        let mut transmitter = KittyTransmitter::probed(true, true);
+        transmitter.fail_shared_memory = true;
+        transmitter.fail_temporary_file = true;
+        let mut output = Vec::new();
+        let stats = transmitter
+            .transmit(
+                &mut output,
+                "a=T",
+                b"content",
+                false,
+                TransferOptions {
+                    zlib: ZlibPolicy::Never,
+                    ..TransferOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(stats.medium, TransferMedium::Direct);
+        assert!(String::from_utf8(output).unwrap().contains(",t=d,m=0;"));
+
+        for transport in [
+            GraphicsTransport::SharedMemory,
+            GraphicsTransport::TemporaryFile,
+        ] {
+            let error = transmitter
+                .transmit(
+                    &mut Vec::new(),
+                    "a=T",
+                    b"content",
+                    false,
+                    TransferOptions {
+                        transport,
+                        ..TransferOptions::default()
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+    }
+
+    #[test]
+    fn empty_payloads_are_rejected() {
+        let error = KittyTransmitter::new(false)
+            .transmit(
+                &mut Vec::new(),
+                "a=T",
+                b"",
+                false,
+                TransferOptions::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

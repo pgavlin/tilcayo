@@ -18,18 +18,12 @@ use super::Rect;
 /// in full regardless of its damage list.
 #[derive(Clone, Debug)]
 pub struct Frame {
-    /// Application-assigned sequence number.
-    pub serial: u64,
-    /// Framebuffer width in pixels.
-    pub width: u32,
-    /// Framebuffer height in pixels.
-    pub height: u32,
-    /// Byte distance between the starts of adjacent rows.
-    pub stride: usize,
-    /// Complete packed RGB pixel storage, with three bytes per pixel.
-    pub pixels: Arc<[u8]>,
-    /// Pixel-space regions changed since the previously submitted state.
-    pub damage: Vec<Rect>,
+    serial: u64,
+    width: u32,
+    height: u32,
+    stride: usize,
+    pixels: Arc<[u8]>,
+    damage: Vec<Rect>,
     pub(crate) produced_at: Instant,
 }
 
@@ -47,15 +41,22 @@ impl Frame {
         damage: Vec<Rect>,
     ) -> io::Result<Self> {
         let pixels = pixels.into();
-        let row = width as usize * 3;
+        let row = usize::try_from(width)
+            .ok()
+            .and_then(|width| width.checked_mul(3))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame row overflow"))?;
         if width == 0 || height == 0 || stride < row {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid RGB layout",
             ));
         }
-        let required = stride
-            .checked_mul(height as usize)
+        let preceding_rows = usize::try_from(height - 1)
+            .ok()
+            .and_then(|height| stride.checked_mul(height))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame size overflow"))?;
+        let required = preceding_rows
+            .checked_add(row)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame size overflow"))?;
         if pixels.len() < required {
             return Err(io::Error::new(
@@ -74,9 +75,43 @@ impl Frame {
         })
     }
 
+    /// Returns the application-assigned sequence number.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// Returns the framebuffer width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Returns the framebuffer height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
     /// Returns `(width, height)` in pixels.
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Returns the byte distance between starts of adjacent rows.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Returns the complete packed RGB pixel storage.
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// Returns pixel-space regions changed since the previous submitted state.
+    pub fn damage(&self) -> &[Rect] {
+        &self.damage
+    }
+
+    pub(crate) fn damage_mut(&mut self) -> &mut Vec<Rect> {
+        &mut self.damage
     }
 
     /// Copies a clipped rectangle into tightly packed RGB storage.
@@ -109,6 +144,17 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_storage_without_padding_after_the_final_row() {
+        let frame = Frame::rgb(3, 2, 2, 8, vec![0; 14], vec![Rect::full(2, 2)]).unwrap();
+        assert_eq!(frame.serial(), 3);
+        assert_eq!(frame.size(), (2, 2));
+        assert_eq!(frame.stride(), 8);
+        assert_eq!(frame.pixels().len(), 14);
+        assert_eq!(frame.damage(), [Rect::full(2, 2)]);
+        assert!(Frame::rgb(3, 2, 2, 8, vec![0; 13], vec![]).is_err());
+    }
 
     #[test]
     fn borrows_contiguous_regions_and_copies_strided_regions() {

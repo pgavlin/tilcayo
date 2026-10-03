@@ -18,7 +18,10 @@ use crate::{
 /// Receives low-overhead notifications from a [`PresenterWorker`].
 ///
 /// Implementations must not block the presentation thread. The default `()`
-/// observer ignores all notifications.
+/// observer ignores all notifications. A panic from an observer stops the
+/// worker; a successfully written frame is published as complete before its
+/// [`Self::presented`] callback, and [`PresenterWorker::shutdown`] reports the
+/// worker panic.
 pub trait PresentationObserver: Send + Sync + 'static {
     /// Called after a frame is accepted by the latest-frame mailbox.
     fn submitted(&self) {}
@@ -64,6 +67,21 @@ pub struct PresenterWorker {
 struct CompletionState {
     latest: Option<u64>,
     stopped: bool,
+}
+
+struct WorkerExit {
+    completion: Arc<Mutex<CompletionState>>,
+    wakeup: Wakeup,
+}
+
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        self.completion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stopped = true;
+        self.wakeup.signal();
+    }
 }
 
 impl PresenterWorker {
@@ -117,6 +135,10 @@ impl PresenterWorker {
         let thread = thread::Builder::new()
             .name("tilcayo-presenter".into())
             .spawn(move || {
+                let _exit = WorkerExit {
+                    completion: worker_completion.clone(),
+                    wakeup: worker_wakeup.clone(),
+                };
                 loop {
                     let event = worker_mailbox.take_event();
                     let closed = matches!(event, MailboxEvent::Closed);
@@ -131,21 +153,21 @@ impl PresenterWorker {
                         }
                         if let MailboxEvent::Presentation(presentation) = event {
                             let (frame, placement) = presentation.into_parts();
-                            let serial = frame.serial;
+                            let serial = frame.serial();
                             let present_started = Instant::now();
                             let stats = presenter.present(&mut writer, &frame, placement)?;
                             let completed = Instant::now();
-                            worker_observer.presented(
-                                stats,
-                                completed.duration_since(present_started),
-                                completed.duration_since(frame.produced_at),
-                            );
                             worker_presented.store(serial, Ordering::Release);
                             worker_completion
                                 .lock()
                                 .expect("presenter completion lock poisoned")
                                 .latest = Some(serial);
                             worker_wakeup.signal();
+                            worker_observer.presented(
+                                stats,
+                                completed.duration_since(present_started),
+                                completed.duration_since(frame.produced_at),
+                            );
                         }
                         Ok::<_, io::Error>(())
                     })();
@@ -158,11 +180,6 @@ impl PresenterWorker {
                         break;
                     }
                 }
-                worker_completion
-                    .lock()
-                    .expect("presenter completion lock poisoned")
-                    .stopped = true;
-                worker_wakeup.signal();
             })
             .expect("spawn presenter thread");
         Self {
@@ -429,6 +446,32 @@ mod tests {
         worker.wakeup().clear().unwrap();
         assert_eq!(worker.take_completion(), Some(7));
         worker.shutdown().unwrap();
+    }
+
+    struct PanickingObserver;
+
+    impl PresentationObserver for PanickingObserver {
+        fn presented(&self, _stats: PresentStats, _elapsed: Duration, _pipeline: Duration) {
+            panic!("observer failed");
+        }
+    }
+
+    #[test]
+    fn observer_panic_still_publishes_completion_and_exit() {
+        let worker = PresenterWorker::spawn_instrumented(
+            RecordingWriter::default(),
+            KittyPresenter::new(1, false),
+            Placement::new(0, 0, 2, 2).unwrap(),
+            Arc::new(PanickingObserver),
+        );
+        worker.submit(test_frame(9)).unwrap();
+        assert!(worker.wakeup().wait(Some(Duration::from_secs(1))).unwrap());
+        assert_eq!(worker.take_completion(), Some(9));
+        while !worker.is_stopped() {
+            worker.wakeup().clear().unwrap();
+            assert!(worker.wakeup().wait(Some(Duration::from_secs(1))).unwrap());
+        }
+        assert!(worker.shutdown().is_err());
     }
 
     #[test]

@@ -5,7 +5,8 @@
 //! framebuffers, plans damaged regions, and writes Kitty graphics protocol
 //! commands using direct, temporary-file, or POSIX shared-memory transfers. Its
 //! latest-frame mailbox prevents slow terminal output from blocking a UI event
-//! loop.
+//! loop. The crate currently targets Unix-like systems with POSIX terminal and
+//! shared-memory APIs.
 
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 

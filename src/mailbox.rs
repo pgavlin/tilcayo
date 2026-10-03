@@ -81,17 +81,16 @@ impl LatestFrameMailbox {
         }
         if let Some(old) = state.pending.take() {
             if old.frame.size() == presentation.frame.size() {
-                presentation.frame.damage.extend(old.frame.damage);
-                presentation.frame.damage = coalesce_bounds(
-                    presentation.frame.damage,
-                    presentation.frame.width,
-                    presentation.frame.height,
-                );
+                presentation
+                    .frame
+                    .damage_mut()
+                    .extend_from_slice(old.frame.damage());
+                let (width, height) = presentation.frame.size();
+                let damage = std::mem::take(presentation.frame.damage_mut());
+                *presentation.frame.damage_mut() = coalesce_bounds(damage, width, height);
             } else {
-                presentation.frame.damage = vec![Rect::full(
-                    presentation.frame.width,
-                    presentation.frame.height,
-                )];
+                let (width, height) = presentation.frame.size();
+                *presentation.frame.damage_mut() = vec![Rect::full(width, height)];
             }
             state.dropped += 1;
         }
@@ -199,8 +198,8 @@ mod tests {
             .submit(presentation(2, vec![Rect::new(1, 1, 1, 1)], 1))
             .unwrap();
         let latest = mailbox.try_take().unwrap();
-        assert_eq!(latest.frame().serial, 2);
-        assert_eq!(latest.frame().damage.len(), 2);
+        assert_eq!(latest.frame().serial(), 2);
+        assert_eq!(latest.frame().damage().len(), 2);
         assert_eq!(latest.placement().column, 1);
         assert_eq!(mailbox.dropped(), 1);
     }

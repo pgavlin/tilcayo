@@ -98,7 +98,7 @@ pub fn probe_terminal_with_events(
     write!(output, "\x1b_Gi={id},s=1,v=1,a=q,t=d,f=24,q=0;AAAA\x1b\\")?;
     output.flush()?;
 
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_after(timeout);
     let mut decoder = ProbeDecoder::default();
     let graphics = wait_for_ack_preserving(input, id, deadline, &mut decoder)?;
     let mut shared_memory = false;
@@ -139,7 +139,7 @@ pub fn wait_for_ack(
     id: u32,
     timeout: Duration,
 ) -> io::Result<bool> {
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_after(timeout);
     let mut parser = Parser::new();
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
@@ -153,7 +153,11 @@ pub fn wait_for_ack(
             break;
         }
         if ready < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
         }
         let mut bytes = [0; 256];
         let count = input.read(&mut bytes)?;
@@ -171,6 +175,17 @@ pub fn wait_for_ack(
         }
     }
     Ok(false)
+}
+
+fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    let mut bounded = timeout;
+    loop {
+        if let Some(deadline) = now.checked_add(bounded) {
+            return deadline;
+        }
+        bounded /= 2;
+    }
 }
 
 fn local_media_eligible() -> bool {
@@ -743,6 +758,11 @@ fn response_for(action: &Action, id: u32) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn excessive_probe_timeouts_are_bounded_without_panicking() {
+        assert!(deadline_after(Duration::MAX) > Instant::now());
+    }
 
     #[test]
     fn creates_sized_shared_memory_probe_payload() {

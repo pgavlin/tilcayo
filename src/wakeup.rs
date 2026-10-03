@@ -3,7 +3,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     os::unix::net::UnixStream,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// A pollable, level-triggered notification handle.
@@ -91,16 +91,23 @@ impl Wakeup {
     /// Returns `true` when state may be available and `false` on timeout. This
     /// convenience method does not clear the handle.
     pub fn wait(&self, timeout: Option<Duration>) -> io::Result<bool> {
-        let milliseconds = match timeout {
-            None => -1,
-            Some(value) => value.as_millis().min(i32::MAX as u128) as i32,
-        };
+        let deadline = timeout.map(|value| Instant::now().checked_add(value));
         let mut descriptor = libc::pollfd {
             fd: self.inner.reader.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
         loop {
+            let milliseconds = match deadline {
+                None => -1,
+                Some(Some(deadline)) => deadline
+                    .checked_duration_since(Instant::now())
+                    .map(|remaining| remaining.as_millis().clamp(1, i32::MAX as u128) as i32)
+                    .unwrap_or(0),
+                // The requested duration exceeds Instant's range. Poll in the
+                // largest supported finite increments rather than timing out early.
+                Some(None) => i32::MAX,
+            };
             let result = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
             if result > 0 {
                 return Ok(true);

@@ -5,7 +5,8 @@
 Tilcayo is a low-level terminal GUI runtime built around the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
 It owns terminal input, graphics output, and session lifecycle while leaving
-rendering, widgets, and application policy to its caller.
+rendering, widgets, and application policy to its caller. Tilcayo currently
+targets Unix-like systems with POSIX terminal and shared-memory APIs.
 
 It provides:
 

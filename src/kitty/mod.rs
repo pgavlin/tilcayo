@@ -143,7 +143,7 @@ impl KittyPresenter {
         let (damage, initialize) = self.planned_damage(frame, size_changed);
         if damage.is_empty() && self.placement == Some(placement) {
             return Ok(PresentStats {
-                serial: frame.serial,
+                serial: frame.serial(),
                 ..PresentStats::default()
             });
         }
@@ -173,9 +173,9 @@ impl KittyPresenter {
 
     fn planned_damage(&self, frame: &Frame, size_changed: bool) -> (Vec<Rect>, bool) {
         let mut damage = plan_damage(
-            frame.width,
-            frame.height,
-            frame.damage.iter().copied(),
+            frame.width(),
+            frame.height(),
+            frame.damage().iter().copied(),
             size_changed,
             self.damage_policy,
         );
@@ -183,7 +183,7 @@ impl KittyPresenter {
         // replace the stable image whenever damaged pixels must change.
         let initialize = size_changed || (!self.animation && !damage.is_empty());
         if initialize {
-            damage = vec![Rect::full(frame.width, frame.height)];
+            damage = vec![Rect::full(frame.width(), frame.height())];
         } else if damage.len() > 1 && self.transmitter.uses_local_media(self.transfer_options) {
             // Kitty reconstructs the complete animation frame after each edit.
             // With local media, one larger edit avoids repeated reconstruction
@@ -206,11 +206,11 @@ impl KittyPresenter {
         damage: &[Rect],
     ) -> io::Result<PresentStats> {
         let mut stats = PresentStats {
-            serial: frame.serial,
+            serial: frame.serial(),
             ..PresentStats::default()
         };
         if initialize {
-            let full = Rect::full(frame.width, frame.height);
+            let full = Rect::full(frame.width(), frame.height());
             let rgb = frame.region_rgb_data(full)?;
             write!(
                 writer,
@@ -223,8 +223,8 @@ impl KittyPresenter {
                 writer,
                 &format!(
                     "a=T,f=24,s={},v={},i={},p={},q=2,C=1,c={},r={}{}",
-                    frame.width,
-                    frame.height,
+                    frame.width(),
+                    frame.height(),
                     self.image_id,
                     self.placement_id,
                     placement.columns,
@@ -271,7 +271,7 @@ impl KittyPresenter {
         if !damage.is_empty() {
             select_frame(writer, self.image_id, 1)?;
             stats.regions = damage.len();
-            stats.full_frame = damage == [Rect::full(frame.width, frame.height)];
+            stats.full_frame = damage == [Rect::full(frame.width(), frame.height())];
         }
         Ok(stats)
     }
@@ -284,10 +284,14 @@ impl KittyPresenter {
 
     /// Deletes the presenter's image from the terminal and invalidates local state.
     pub fn delete(&mut self, writer: &mut impl Write) -> io::Result<()> {
-        write!(writer, "\x1b_Ga=d,d=I,i={},q=2;\x1b\\", self.image_id)?;
-        writer.flush()?;
+        let result = (|| {
+            write!(writer, "\x1b_Ga=d,d=I,i={},q=2;\x1b\\", self.image_id)?;
+            writer.flush()
+        })();
+        // A successful delete removes the image, while a failed write leaves
+        // terminal state uncertain. Both cases require reinitialization.
         self.invalidate();
-        Ok(())
+        result
     }
 }
 
@@ -452,6 +456,30 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
         }
+    }
+
+    #[test]
+    fn failed_delete_invalidates_the_image() {
+        let placement = Placement::new(0, 0, 4, 2).unwrap();
+        let mut presenter = KittyPresenter::new(7, false);
+        presenter.set_transfer_options(TransferOptions {
+            transport: GraphicsTransport::Direct,
+            zlib: ZlibPolicy::Never,
+            chunk_size: 4096,
+        });
+        presenter
+            .present(&mut Vec::new(), &frame(1, vec![]), placement)
+            .unwrap();
+
+        assert!(presenter.delete(&mut FailFlush(Vec::new())).is_err());
+        let mut retry = Vec::new();
+        assert!(
+            presenter
+                .present(&mut retry, &frame(2, vec![]), placement)
+                .unwrap()
+                .full_frame
+        );
+        assert!(String::from_utf8(retry).unwrap().contains("a=T"));
     }
 
     #[test]

@@ -270,15 +270,27 @@ impl Runtime {
 
     /// Stops and joins workers before restoring terminal modes.
     pub fn shutdown(mut self) -> io::Result<()> {
-        if let Some(mut input) = self.input.take() {
-            input.shutdown()?;
-        }
-        let result = match self.presenter.take() {
+        let input_result = match self.input.take() {
+            Some(mut input) => input.shutdown(),
+            None => Ok(()),
+        };
+        let presenter_result = match self.presenter.take() {
             Some(presenter) => presenter.shutdown(),
             None => Ok(()),
         };
         self.session.take();
-        result
+        combine_shutdown_results(input_result, presenter_result)
+    }
+}
+
+fn combine_shutdown_results(input: io::Result<()>, presenter: io::Result<()>) -> io::Result<()> {
+    match (input, presenter) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(input), Err(presenter)) => Err(io::Error::new(
+            input.kind(),
+            format!("input shutdown failed: {input}; presenter shutdown failed: {presenter}"),
+        )),
     }
 }
 
@@ -292,5 +304,24 @@ impl Drop for Runtime {
         // should use `shutdown` for ordered output completion and restoration.
         self.presenter.take();
         self.session.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_reports_both_worker_errors() {
+        let error = combine_shutdown_results(
+            Err(io::Error::other("input")),
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "output")),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("input shutdown failed: input"));
+        assert!(error
+            .to_string()
+            .contains("presenter shutdown failed: output"));
     }
 }
