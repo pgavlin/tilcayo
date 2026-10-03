@@ -11,13 +11,17 @@ use base64::Engine as _;
 use flate2::{write::ZlibEncoder, Compression};
 
 static NEXT_TRANSFER: AtomicU64 = AtomicU64::new(1);
+const ADAPTIVE_SAMPLE_THRESHOLD: usize = 64 * 1024;
+const ADAPTIVE_SAMPLE_WINDOW: usize = 4 * 1024;
+const ADAPTIVE_SAMPLE_COUNT: usize = 4;
 
 /// Policy for trading compression work against graphics payload size.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ZlibPolicy {
     /// Never compress payloads, minimizing CPU work at the cost of transfer size.
     Never,
-    /// Compress non-local payloads only when the compressed result is smaller.
+    /// Compress non-local payloads only when they appear compressible and the
+    /// compressed result is smaller. Large payloads are sampled first.
     Adaptive,
     /// Always compress payloads, even when compression increases their size.
     Always,
@@ -57,7 +61,8 @@ pub enum TransferMedium {
 ///
 /// Compression reduces direct-transfer traffic at the cost of CPU time.
 /// [`ZlibPolicy::Adaptive`], the default, considers compression when no local
-/// medium is selected and keeps the compressed form only when it is smaller.
+/// medium is selected, samples large payloads to avoid futile work, and keeps
+/// the compressed form only when it is smaller.
 /// The default 4096-byte chunk size is the Kitty protocol maximum and normally
 /// minimizes direct-transfer framing overhead. Smaller chunks are useful only
 /// when required by an intermediary.
@@ -211,9 +216,11 @@ impl KittyTransmitter {
                 options.transport,
                 GraphicsTransport::TemporaryFile | GraphicsTransport::SharedMemory
             );
-        let compressed = if options.zlib == ZlibPolicy::Always
-            || (options.zlib == ZlibPolicy::Adaptive && !local)
-        {
+        let compress = options.zlib == ZlibPolicy::Always
+            || (options.zlib == ZlibPolicy::Adaptive
+                && !local
+                && adaptive_sample_compresses(bytes)?);
+        let compressed = if compress {
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
             encoder.write_all(bytes)?;
             Some(encoder.finish()?)
@@ -371,6 +378,23 @@ impl KittyTransmitter {
     }
 }
 
+fn adaptive_sample_compresses(bytes: &[u8]) -> io::Result<bool> {
+    if bytes.len() <= ADAPTIVE_SAMPLE_THRESHOLD {
+        return Ok(true);
+    }
+
+    let last_start = bytes.len() - ADAPTIVE_SAMPLE_WINDOW;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    for index in 0..ADAPTIVE_SAMPLE_COUNT {
+        let denominator = ADAPTIVE_SAMPLE_COUNT - 1;
+        let start =
+            (last_start / denominator) * index + (last_start % denominator) * index / denominator;
+        encoder.write_all(&bytes[start..start + ADAPTIVE_SAMPLE_WINDOW])?;
+    }
+    let compressed = encoder.finish()?;
+    Ok(compressed.len() < ADAPTIVE_SAMPLE_WINDOW * ADAPTIVE_SAMPLE_COUNT)
+}
+
 struct ShmObject {
     name: CString,
     armed: bool,
@@ -410,6 +434,21 @@ impl Drop for TemporaryObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adaptive_sampling_rejects_large_incompressible_payloads() {
+        let mut state = 0x1234_5678_u32;
+        let noise: Vec<_> = (0..ADAPTIVE_SAMPLE_THRESHOLD * 2)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        assert!(!adaptive_sample_compresses(&noise).unwrap());
+        assert!(adaptive_sample_compresses(&vec![0xa5; noise.len()]).unwrap());
+    }
 
     #[test]
     fn direct_transfer_is_chunked_and_adaptively_compressed() {
