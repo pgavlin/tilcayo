@@ -36,6 +36,8 @@ pub struct GraphicsCapabilities {
     pub temporary_file: bool,
     /// Animation-frame updates were successfully queried.
     pub animation: bool,
+    /// The transient graphics usage hint was accepted by the terminal.
+    pub transient: bool,
 }
 
 /// Capabilities discovered during the isolated terminal probe phase.
@@ -102,8 +104,10 @@ pub fn probe_terminal_with_events(
     let mut shared_memory = false;
     let mut temporary_file = false;
     let mut animation = false;
+    let mut transient = false;
 
     if graphics {
+        transient = probe_transient_hint(input, output, deadline, &mut decoder)?;
         if local_media_eligible() {
             shared_memory = probe_shared_memory(input, output, deadline, &mut decoder)?;
             temporary_file = probe_temporary_file(input, output, deadline, &mut decoder)?;
@@ -120,6 +124,7 @@ pub fn probe_terminal_with_events(
                 shared_memory,
                 temporary_file,
                 animation,
+                transient,
             },
             logical_dpi,
         },
@@ -172,6 +177,26 @@ fn local_media_eligible() -> bool {
     std::env::var_os("SSH_CONNECTION").is_none()
         && std::env::var_os("TMUX").is_none()
         && std::env::var_os("STY").is_none()
+}
+
+fn probe_transient_hint(
+    input: &mut (impl Read + AsRawFd),
+    output: &mut impl Write,
+    deadline: Instant,
+    decoder: &mut ProbeDecoder,
+) -> io::Result<bool> {
+    let id = std::process::id().wrapping_add(0x575d).max(1);
+    let sentinel_id = std::process::id().wrapping_add(0x575e).max(1);
+    // Older Kitty versions reject an unknown N key without producing a
+    // graphics response. Follow the extension query with a baseline query so
+    // that rejection can be distinguished from an unresponsive terminal.
+    write!(
+        output,
+        "\x1b_Gi={id},s=1,v=1,a=q,t=d,f=24,q=0,N=1;AAAA\x1b\\\x1b_Gi={sentinel_id},s=1,v=1,a=q,t=d,f=24,q=0;AAAA\x1b\\"
+    )?;
+    output.flush()?;
+    wait_for_either_ack_preserving(input, id, sentinel_id, deadline, decoder)
+        .map(|response| response == Some((id, true)))
 }
 
 fn probe_shared_memory(
@@ -403,6 +428,43 @@ impl Drop for ProbeTemp {
     }
 }
 
+fn wait_for_either_ack_preserving(
+    input: &mut (impl Read + AsRawFd),
+    primary_id: u32,
+    sentinel_id: u32,
+    deadline: Instant,
+    decoder: &mut ProbeDecoder,
+) -> io::Result<Option<(u32, bool)>> {
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if ready == 0 {
+            break;
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let mut bytes = [0; 256];
+        let count = input.read(&mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        if let Some(response) = decoder.feed_either(&bytes[..count], primary_id, sentinel_id) {
+            return Ok(Some(response));
+        }
+    }
+    Ok(None)
+}
+
 fn wait_for_ack_preserving(
     input: &mut (impl Read + AsRawFd),
     id: u32,
@@ -456,6 +518,19 @@ enum ProtocolString {
 
 impl ProbeDecoder {
     fn feed(&mut self, bytes: &[u8], id: u32) -> Option<bool> {
+        self.feed_matching(bytes, &[id]).map(|(_, ok)| ok)
+    }
+
+    fn feed_either(
+        &mut self,
+        bytes: &[u8],
+        primary_id: u32,
+        sentinel_id: u32,
+    ) -> Option<(u32, bool)> {
+        self.feed_matching(bytes, &[primary_id, sentinel_id])
+    }
+
+    fn feed_matching(&mut self, bytes: &[u8], ids: &[u32]) -> Option<(u32, bool)> {
         const KITTY_PREFIX: &[u8] = b"\x1b_G";
         const DCS_PREFIX: &[u8] = b"\x1bP";
         const STRING_TERMINATOR: &[u8] = b"\x1b\\";
@@ -496,8 +571,12 @@ impl ProbeDecoder {
                 ProtocolString::KittyGraphics => {
                     let mut parser = Parser::new();
                     for action in parser.parse_as_vec(&command) {
-                        if let Some(ok) = response_for(&action, id) {
-                            response = Some(ok);
+                        if let Some(value) =
+                            graphics_response(&action).filter(|(id, _)| ids.contains(id))
+                        {
+                            if value.0 == ids[0] || response.is_none() {
+                                response = Some(value);
+                            }
                         }
                     }
                 }
@@ -645,17 +724,20 @@ fn adapt_probe_input(event: InputEvent) -> Option<Event> {
     Some(Event::Key(KeyEvent::new(code, modifiers)))
 }
 
-fn response_for(action: &Action, id: u32) -> Option<bool> {
+fn graphics_response(action: &Action) -> Option<(u32, bool)> {
     let Action::KittyImage(image) = action else {
         return None;
     };
     let KittyImage::TransmitData { transmit, .. } = image.as_ref() else {
         return None;
     };
-    if transmit.image_id != Some(id) {
-        return None;
-    }
-    Some(matches!(&transmit.data, KittyImageData::Direct(payload) if payload == "OK"))
+    let id = transmit.image_id?;
+    let ok = matches!(&transmit.data, KittyImageData::Direct(payload) if payload == "OK");
+    Some((id, ok))
+}
+
+fn response_for(action: &Action, id: u32) -> Option<bool> {
+    graphics_response(action).and_then(|(response_id, ok)| (response_id == id).then_some(ok))
 }
 
 #[cfg(test)]
@@ -696,6 +778,58 @@ mod tests {
             .parse_as_vec(b"\x1b_Gi=77;EINVAL\x1b\\")
             .iter()
             .any(|action| response_for(action, 77) == Some(true)));
+    }
+
+    #[test]
+    fn usage_hint_probe_accepts_a_sentinel_for_unsupported_terminals() {
+        let mut decoder = ProbeDecoder::default();
+        assert_eq!(
+            decoder.feed_either(b"\x1b_Gi=78;OK\x1b\\", 77, 78),
+            Some((78, true))
+        );
+    }
+
+    #[test]
+    fn unsupported_usage_hint_probe_does_not_wait_for_timeout() {
+        use std::{os::unix::net::UnixStream, thread};
+
+        let (client, mut terminal) = UnixStream::pair().unwrap();
+        let mut input = client.try_clone().unwrap();
+        let mut output = client;
+        let sentinel_id = std::process::id().wrapping_add(0x575e).max(1);
+        let terminal = thread::spawn(move || {
+            let mut commands = Vec::new();
+            while commands
+                .windows(2)
+                .filter(|bytes| *bytes == b"\x1b\\")
+                .count()
+                < 2
+            {
+                let mut bytes = [0; 256];
+                let count = terminal.read(&mut bytes).unwrap();
+                commands.extend_from_slice(&bytes[..count]);
+            }
+            assert!(commands.windows(3).any(|bytes| bytes == b"N=1"));
+            write!(terminal, "\x1b_Gi={sentinel_id};OK\x1b\\").unwrap();
+        });
+        let mut decoder = ProbeDecoder::default();
+        assert!(!probe_transient_hint(
+            &mut input,
+            &mut output,
+            Instant::now() + Duration::from_secs(1),
+            &mut decoder,
+        )
+        .unwrap());
+        terminal.join().unwrap();
+    }
+
+    #[test]
+    fn usage_hint_probe_prefers_the_extension_response() {
+        let mut decoder = ProbeDecoder::default();
+        assert_eq!(
+            decoder.feed_either(b"\x1b_Gi=77;OK\x1b\\\x1b_Gi=78;OK\x1b\\", 77, 78),
+            Some((77, true))
+        );
     }
 
     #[test]

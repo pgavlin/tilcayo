@@ -86,6 +86,7 @@ impl Runtime {
                     shared_memory: false,
                     temporary_file: false,
                     animation: false,
+                    transient: false,
                 },
                 Vec::new(),
             )
@@ -106,6 +107,7 @@ impl Runtime {
             KittyPresenter::probed(
                 config.image_id,
                 graphics.animation,
+                graphics.transient,
                 graphics.shared_memory,
                 graphics.temporary_file,
             ),

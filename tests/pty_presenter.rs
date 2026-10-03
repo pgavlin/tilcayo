@@ -157,6 +157,7 @@ fn fake_terminal_answers_fragmented_capability_probe() {
     assert!(events.is_empty());
     assert!(probe.graphics.graphics);
     assert!(probe.graphics.animation);
+    assert!(probe.graphics.transient);
     assert_eq!(probe.logical_dpi.unwrap().x(), 144.0);
     assert_eq!(probe.logical_dpi.unwrap().y(), 144.0);
 }

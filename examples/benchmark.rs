@@ -195,6 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut output,
         Duration::from_millis(RESPONSE_TIMEOUT_MS as u64),
     )?;
+    eprintln!("graphics capabilities: {capabilities:?}");
     validate_capabilities(args.suite, capabilities)?;
 
     let image_id = (std::process::id() | 0x4000_0000).max(1);
@@ -248,6 +249,7 @@ fn run_benchmarks(
             for &mode in modes {
                 for case in damage_cases(width, height) {
                     let mut presenter = KittyPresenter::new(image_id, true);
+                    presenter.set_transient_hint(capabilities.transient);
                     presenter.set_transfer_options(config.transfer_options());
 
                     if matches!(mode, UpdateMode::RootEdit) {

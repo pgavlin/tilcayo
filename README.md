@@ -15,7 +15,7 @@ It provides:
 - full-image replacement on terminals limited to baseline Kitty graphics;
 - verified POSIX shared-memory and temporary-file transfers for local updates;
 - direct transfer with adaptive zlib compression when local media are unavailable;
-- capability probing with fragmented-reply parsing and preservation of concurrent startup input;
+- capability probing for graphics extensions, including transient image hints, with fragmented-reply parsing and preservation of concurrent startup input;
 - optional Kitty logical-DPI discovery for point-sized UI and font scaling;
 - raw mode, alternate-screen, keyboard, mouse, focus, paste, and resize setup;
 - a single stoppable terminal event reader;

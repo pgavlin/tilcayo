@@ -68,6 +68,7 @@ pub struct KittyPresenter {
     initialized_size: Option<(u32, u32)>,
     placement: Option<Placement>,
     animation: bool,
+    transient: bool,
     transmitter: KittyTransmitter,
     transfer_options: TransferOptions,
     damage_policy: DamagePolicy,
@@ -86,6 +87,7 @@ impl KittyPresenter {
             initialized_size: None,
             placement: None,
             animation: true,
+            transient: false,
             transmitter: KittyTransmitter::new(local_media),
             transfer_options: TransferOptions::default(),
             damage_policy: DamagePolicy::default(),
@@ -102,11 +104,13 @@ impl KittyPresenter {
     pub(crate) fn probed(
         image_id: u32,
         animation: bool,
+        transient: bool,
         shared_memory: bool,
         temporary_file: bool,
     ) -> Self {
         let mut value = Self::new(image_id, false);
         value.animation = animation;
+        value.transient = transient;
         value.transmitter = KittyTransmitter::probed(shared_memory, temporary_file);
         value
     }
@@ -114,6 +118,15 @@ impl KittyPresenter {
     /// Replaces the options used for subsequent payload transfers.
     pub fn set_transfer_options(&mut self, options: TransferOptions) {
         self.transfer_options = options;
+    }
+
+    /// Enables or disables Kitty's transient image usage hint.
+    ///
+    /// Enable this only after [`GraphicsCapabilities::transient`] has been
+    /// actively verified. Older terminals may reject entire graphics commands
+    /// containing an unknown `N` key.
+    pub fn set_transient_hint(&mut self, enabled: bool) {
+        self.transient = enabled;
     }
 
     /// Presents a frame at `placement`, transferring only planned damage when possible.
@@ -205,16 +218,18 @@ impl KittyPresenter {
                 placement.row + 1,
                 placement.column + 1
             )?;
+            let transient = if self.transient { ",N=1" } else { "" };
             let transfer = self.transmitter.transmit(
                 writer,
                 &format!(
-                    "a=T,f=24,s={},v={},i={},p={},q=2,C=1,c={},r={}",
+                    "a=T,f=24,s={},v={},i={},p={},q=2,C=1,c={},r={}{}",
                     frame.width,
                     frame.height,
                     self.image_id,
                     self.placement_id,
                     placement.columns,
-                    placement.rows
+                    placement.rows,
+                    transient
                 ),
                 rgb.as_ref(),
                 false,
@@ -238,13 +253,14 @@ impl KittyPresenter {
                 placement.rows
             )?;
         }
+        let transient = if self.transient { ",N=1" } else { "" };
         for &rect in damage {
             let rgb = frame.region_rgb_data(rect)?;
             let transfer = self.transmitter.transmit(
                 writer,
                 &format!(
-                    "a=f,r=1,i={},f=24,q=2,x={},y={},s={},v={},X=1",
-                    self.image_id, rect.x, rect.y, rect.width, rect.height
+                    "a=f,r=1,i={},f=24,q=2,x={},y={},s={},v={},X=1{}",
+                    self.image_id, rect.x, rect.y, rect.width, rect.height, transient
                 ),
                 rgb.as_ref(),
                 true,
@@ -371,9 +387,37 @@ mod tests {
     }
 
     #[test]
+    fn verified_transient_hint_is_sent_with_image_data() {
+        let placement = Placement::new(0, 0, 4, 2).unwrap();
+        let mut presenter = KittyPresenter::new(7, false);
+        presenter.set_transient_hint(true);
+        presenter.set_transfer_options(TransferOptions {
+            transport: GraphicsTransport::Direct,
+            zlib: ZlibPolicy::Never,
+            chunk_size: 4096,
+        });
+        let mut output = Vec::new();
+        presenter
+            .present(&mut output, &frame(1, vec![]), placement)
+            .unwrap();
+        let split = output.len();
+        presenter
+            .present(
+                &mut output,
+                &frame(2, vec![Rect::new(1, 0, 1, 1)]),
+                placement,
+            )
+            .unwrap();
+        let initial = String::from_utf8_lossy(&output[..split]);
+        let update = String::from_utf8_lossy(&output[split..]);
+        assert!(initial.contains("a=T,f=24") && initial.contains(",N=1,t=d,"));
+        assert!(update.contains("a=f,r=1") && update.contains(",N=1,t=d,"));
+    }
+
+    #[test]
     fn baseline_graphics_retransmits_damaged_frames() {
         let placement = Placement::new(0, 0, 4, 2).unwrap();
-        let mut presenter = KittyPresenter::probed(7, false, false, false);
+        let mut presenter = KittyPresenter::probed(7, false, false, false, false);
         presenter.set_transfer_options(TransferOptions {
             transport: GraphicsTransport::Direct,
             zlib: ZlibPolicy::Never,
