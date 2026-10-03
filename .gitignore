@@ -1,4 +1,5 @@
 /target/
+/examples/mp4-player/target/
 /TODO.md
 /RELEASING.md
 *.swp

@@ -84,13 +84,28 @@ Run the completion-paced, source-derived AMICUS Boing Ball demo:
 cargo run --release --example boing_ball
 ```
 
+Play an MP4 with timestamp-paced video and audio:
+
+```sh
+cargo run --release --manifest-path examples/mp4-player/Cargo.toml -- path/to/video.mp4
+```
+
+The player is a separate package so its native multimedia dependencies do not
+burden Tilcayo itself. It links to FFmpeg through `ffmpeg-next`, decodes audio
+and video in-process, sends audio through Rodio, and uses the consumed audio
+position as the video clock. Install FFmpeg development libraries first
+(`brew install ffmpeg` on macOS; distribution FFmpeg development packages on
+Linux). Decoding is bounded, late video frames are dropped, and resolution
+defaults to a maximum of 1280×720. Pass `--no-audio` for video-only playback or
+run with `--help` for sizing options.
+
 In any example, press `q` or Escape to exit. In the painting demo, drag with
 the mouse to draw, use different mouse buttons for different colors, and press
 `c` to clear the canvas. In the Boing Ball demo, press Space to pause or `r`
 to restart the animation. Its 320×216 indexed framebuffer, wireframe room,
 faceted ball, palette cycling, and fixed-step physics follow the analyzed AMICUS
 Disk 9 variant; see [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for
-credits.
+credits. In the MP4 player, press Space to pause or resume playback.
 
 ## License
 

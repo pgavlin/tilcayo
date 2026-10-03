@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog], and this project adheres to
 - Pollable input, presentation-completion, failure, and shutdown wakeups.
 - Bounded terminal input with adjacent pointer-motion coalescing.
 - Completion-paced, damage-tracked Boing Ball example.
+- Native MP4 player package with bounded FFmpeg audio/video decoding, audio-clock synchronization, late-frame dropping, resizing, and pause/resume.
 
 ### Changed
 

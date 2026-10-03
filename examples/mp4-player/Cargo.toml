@@ -1,0 +1,11 @@
+[package]
+name = "tilcayo-mp4-player"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+rodio = { version = "0.20.1", default-features = false }
+tilcayo = { path = "../.." }
