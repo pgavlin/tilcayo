@@ -18,10 +18,12 @@ It provides:
 - capability probing for graphics extensions, including transient image hints, with fragmented-reply parsing and preservation of concurrent startup input;
 - optional Kitty logical-DPI discovery for point-sized UI and font scaling;
 - raw mode, alternate-screen, keyboard, mouse, focus, paste, and resize setup;
-- a single stoppable terminal event reader;
+- a bounded terminal event reader that coalesces adjacent pointer motion;
 - pixel-pointer mapping through the image placement;
 - OSC 52 clipboard output;
-- a single-slot latest-frame mailbox and blocking presentation worker; and
+- placement snapshots coupled atomically to latest-frame mailbox submissions;
+- coalesced presentation completions for explicit backpressure;
+- pollable input, completion, failure, and shutdown wakeups; and
 - terminal restoration, presentation statistics, and observer hooks.
 
 ```rust,no_run

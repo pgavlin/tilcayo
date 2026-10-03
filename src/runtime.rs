@@ -4,7 +4,8 @@ use crate::{
     clipboard::osc52,
     input::EventReader,
     kitty::{probe_terminal_with_events, GraphicsCapabilities, KittyPresenter, Placement},
-    Event, Frame, PresentationObserver, PresenterWorker, TerminalCapabilities, TerminalSession,
+    Event, Frame, Presentation, PresentationObserver, PresenterWorker, TerminalCapabilities,
+    TerminalSession, Wakeup,
 };
 
 /// Configures terminal discovery and graphics resources for [`Runtime::enter`].
@@ -17,7 +18,8 @@ use crate::{
 /// missing; a shorter timeout can produce false negatives.
 ///
 /// The default configuration allows 500 milliseconds for probing, requires
-/// graphics support, and uses Kitty image identifier 1. Setting
+/// graphics support, uses Kitty image identifier 1, and bounds pending input
+/// at 256 events. Setting
 /// [`Self::probe_timeout`] to `None` avoids probe latency but leaves optional
 /// features disabled and infers baseline graphics support only from Kitty's
 /// environment marker. Setting [`Self::require_graphics`] to `false` permits
@@ -31,6 +33,8 @@ pub struct RuntimeConfig {
     pub probe_timeout: Option<Duration>,
     /// Whether startup fails if baseline Kitty graphics support is not detected.
     pub require_graphics: bool,
+    /// Maximum number of queued terminal events before input applies backpressure.
+    pub input_capacity: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -39,6 +43,7 @@ impl Default for RuntimeConfig {
             image_id: 1,
             probe_timeout: Some(Duration::from_millis(500)),
             require_graphics: true,
+            input_capacity: 256,
         }
     }
 }
@@ -57,6 +62,7 @@ pub struct Runtime {
     input: Option<EventReader>,
     presenter: Option<PresenterWorker>,
     session: Option<TerminalSession>,
+    wakeup: Wakeup,
 }
 
 impl Runtime {
@@ -102,7 +108,8 @@ impl Runtime {
 
         session.enable_input()?;
         let placement = Placement::new(0, 0, capabilities.size.columns, capabilities.size.rows)?;
-        let presenter = PresenterWorker::spawn_instrumented(
+        let wakeup = Wakeup::new()?;
+        let presenter = PresenterWorker::spawn_instrumented_with_wakeup(
             io::stdout(),
             KittyPresenter::probed(
                 config.image_id,
@@ -113,8 +120,13 @@ impl Runtime {
             ),
             placement,
             observer,
+            wakeup.clone(),
         );
-        let input = match EventReader::spawn_with_events(pending_events) {
+        let input = match EventReader::spawn_with_events_and_wakeup(
+            pending_events,
+            config.input_capacity,
+            wakeup.clone(),
+        ) {
             Ok(input) => input,
             Err(error) => {
                 let _ = presenter.shutdown();
@@ -129,6 +141,7 @@ impl Runtime {
             input: Some(input),
             presenter: Some(presenter),
             session: Some(session),
+            wakeup,
         })
     }
 
@@ -154,16 +167,13 @@ impl Runtime {
         self.presenter
             .as_ref()
             .expect("runtime presenter unavailable")
-            .submit(frame)
+            .submit_presentation(Presentation::new(frame, self.placement))
+            .map_err(|presentation| presentation.into_parts().0)
     }
 
-    /// Changes the placement used by subsequently presented frames.
+    /// Changes the placement captured by subsequently submitted frames.
     pub fn set_placement(&mut self, placement: Placement) {
         self.placement = placement;
-        self.presenter
-            .as_ref()
-            .expect("runtime presenter unavailable")
-            .set_placement(placement);
     }
 
     /// Queues an OSC 52 host-clipboard update.
@@ -206,6 +216,40 @@ impl Runtime {
             .as_ref()
             .expect("runtime presenter unavailable")
             .presented_serial()
+    }
+
+    /// Takes the newest unconsumed successfully written frame serial.
+    ///
+    /// Multiple completions may be coalesced. This can be used as a
+    /// presentation credit: after receiving one, the presenter is no longer
+    /// writing that frame, though one newer frame may remain pending.
+    pub fn take_completion(&self) -> Option<u64> {
+        self.presenter
+            .as_ref()
+            .expect("runtime presenter unavailable")
+            .take_completion()
+    }
+
+    /// Returns the pollable handle shared by input and presentation workers.
+    ///
+    /// It becomes readable for terminal input, presentation completion,
+    /// output/input failure, or worker shutdown. Call [`Wakeup::clear`] before
+    /// draining [`Self::try_event`], [`Self::take_completion`], and status methods.
+    pub fn wakeup(&self) -> &Wakeup {
+        &self.wakeup
+    }
+
+    /// Returns whether either runtime worker has stopped.
+    pub fn is_stopped(&self) -> bool {
+        self.input
+            .as_ref()
+            .expect("runtime input unavailable")
+            .is_stopped()
+            || self
+                .presenter
+                .as_ref()
+                .expect("runtime presenter unavailable")
+                .is_stopped()
     }
 
     /// Returns the number of pending frames replaced by newer submissions.

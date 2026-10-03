@@ -20,6 +20,7 @@ pub mod kitty;
 mod mailbox;
 mod runtime;
 mod session;
+mod wakeup;
 mod worker;
 
 pub use capabilities::{LogicalDpi, TerminalCapabilities, TerminalSize};
@@ -32,7 +33,8 @@ pub use events::{
 pub use frame::Frame;
 pub use input::{map_pixel_pointer, EventReader};
 pub use kitty::Placement;
-pub use mailbox::LatestFrameMailbox;
+pub use mailbox::{LatestFrameMailbox, Presentation};
 pub use runtime::{Runtime, RuntimeConfig};
 pub use session::TerminalSession;
+pub use wakeup::Wakeup;
 pub use worker::{PresentationObserver, PresenterWorker};

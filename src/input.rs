@@ -1,8 +1,9 @@
 use std::{
+    collections::VecDeque,
     io,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -19,6 +20,7 @@ use crossterm::event::{
 use crate::{
     kitty::Placement, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, MediaKeyCode,
     ModifierKeyCode, Modifiers, PointerButton, PointerEvent, PointerEventKind, TerminalSize,
+    Wakeup,
 };
 
 /// Adapts one Crossterm event into Tilcayo's runtime event type.
@@ -180,14 +182,117 @@ fn adapt_button(value: CrosstermMouseButton) -> PointerButton {
     }
 }
 
+const DEFAULT_EVENT_CAPACITY: usize = 256;
+
 /// The sole terminal-input consumer used by [`crate::Runtime`].
 ///
-/// The reader polls with a short timeout so it can be stopped and joined
-/// without requiring another byte of terminal input.
+/// Input is stored in a bounded queue. Adjacent pointer-motion events with the
+/// same kind and modifiers are coalesced to their latest coordinates. Keys,
+/// button transitions, wheel events, focus changes, paste, and resize events
+/// are never dropped or reordered; the reader applies backpressure when the
+/// queue is full. The reader polls with a short timeout so it can be stopped and
+/// joined without requiring another byte of terminal input.
 pub struct EventReader {
-    receiver: mpsc::Receiver<io::Result<Event>>,
+    queue: Arc<EventQueue>,
     stop: Arc<AtomicBool>,
+    wakeup: Wakeup,
     thread: Option<JoinHandle<()>>,
+}
+
+struct EventQueue {
+    capacity: usize,
+    state: Mutex<EventQueueState>,
+    changed: Condvar,
+    wakeup: Wakeup,
+}
+
+#[derive(Default)]
+struct EventQueueState {
+    events: VecDeque<io::Result<Event>>,
+    closed: bool,
+}
+
+impl EventQueue {
+    fn push(&self, value: io::Result<Event>) -> bool {
+        let mut state = self.state.lock().expect("terminal event queue poisoned");
+        if state.closed {
+            return false;
+        }
+        if let Ok(event) = &value {
+            if let Some(Ok(previous)) = state.events.back_mut() {
+                if replaceable_motion(previous, event) {
+                    *previous = event.clone();
+                    drop(state);
+                    self.wakeup.signal();
+                    return true;
+                }
+            }
+        }
+        while state.events.len() == self.capacity && !state.closed {
+            state = self
+                .changed
+                .wait(state)
+                .expect("terminal event queue poisoned");
+        }
+        if state.closed {
+            return false;
+        }
+        state.events.push_back(value);
+        drop(state);
+        self.wakeup.signal();
+        true
+    }
+
+    fn try_pop(&self) -> Option<io::Result<Event>> {
+        let mut state = self.state.lock().expect("terminal event queue poisoned");
+        let value = state.events.pop_front();
+        if value.is_some() {
+            self.changed.notify_one();
+        }
+        value
+    }
+
+    fn pop(&self) -> Option<io::Result<Event>> {
+        let mut state = self.state.lock().expect("terminal event queue poisoned");
+        while state.events.is_empty() && !state.closed {
+            state = self
+                .changed
+                .wait(state)
+                .expect("terminal event queue poisoned");
+        }
+        let value = state.events.pop_front();
+        if value.is_some() {
+            self.changed.notify_one();
+        }
+        value
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().expect("terminal event queue poisoned");
+        state.closed = true;
+        self.changed.notify_all();
+        drop(state);
+        self.wakeup.signal();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("terminal event queue poisoned")
+            .closed
+    }
+}
+
+fn replaceable_motion(previous: &Event, next: &Event) -> bool {
+    let (Event::Pointer(previous), Event::Pointer(next)) = (previous, next) else {
+        return false;
+    };
+    previous.modifiers == next.modifiers
+        && matches!(
+            previous.kind,
+            PointerEventKind::Moved | PointerEventKind::Drag(_)
+        )
+        && previous.kind == next.kind
 }
 
 impl EventReader {
@@ -195,18 +300,58 @@ impl EventReader {
     ///
     /// Only one reader may consume terminal input at a time.
     pub fn spawn() -> io::Result<Self> {
-        Self::spawn_with_events(Vec::new())
+        Self::spawn_with_capacity(DEFAULT_EVENT_CAPACITY)
     }
 
-    pub(crate) fn spawn_with_events(initial: Vec<Event>) -> io::Result<Self> {
-        let (sender, receiver) = mpsc::channel();
+    /// Starts a reader with space for at most `capacity` queued events.
+    ///
+    /// Returns an error if `capacity` is zero. Adjacent compatible pointer
+    /// motions occupy one slot regardless of how many are received.
+    pub fn spawn_with_capacity(capacity: usize) -> io::Result<Self> {
+        let wakeup = Wakeup::new()?;
+        Self::spawn_with_events_and_wakeup(Vec::new(), capacity, wakeup)
+    }
+
+    pub(crate) fn spawn_with_events_and_wakeup(
+        initial: Vec<Event>,
+        capacity: usize,
+        wakeup: Wakeup,
+    ) -> io::Result<Self> {
+        if capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal event capacity must be nonzero",
+            ));
+        }
+        let mut initial_state = EventQueueState::default();
         for event in initial {
-            sender.send(Ok(event)).map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "terminal event queue closed")
-            })?;
+            if let Some(Ok(previous)) = initial_state.events.back_mut() {
+                if replaceable_motion(previous, &event) {
+                    *previous = event;
+                    continue;
+                }
+            }
+            if initial_state.events.len() == capacity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "probe-time input exceeds terminal event capacity",
+                ));
+            }
+            initial_state.events.push_back(Ok(event));
+        }
+        let has_initial = !initial_state.events.is_empty();
+        let queue = Arc::new(EventQueue {
+            capacity,
+            state: Mutex::new(initial_state),
+            changed: Condvar::new(),
+            wakeup: wakeup.clone(),
+        });
+        if has_initial {
+            wakeup.signal();
         }
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
+        let worker_queue = queue.clone();
         let thread = thread::Builder::new()
             .name("tilcayo-input".into())
             .spawn(move || {
@@ -214,7 +359,7 @@ impl EventReader {
                     let ready = match event::poll(Duration::from_millis(50)) {
                         Ok(ready) => ready,
                         Err(error) => {
-                            let _ = sender.send(Err(error));
+                            let _ = worker_queue.push(Err(error));
                             break;
                         }
                     };
@@ -227,25 +372,27 @@ impl EventReader {
                         })
                     });
                     let failed = result.is_err();
-                    if sender.send(result).is_err() || failed {
+                    if !worker_queue.push(result) || failed {
                         break;
                     }
                 }
+                worker_queue.close();
             })?;
         Ok(Self {
-            receiver,
+            queue,
             stop,
+            wakeup,
             thread: Some(thread),
         })
     }
 
     /// Returns the next queued event without blocking.
     pub fn try_recv(&self) -> io::Result<Option<Event>> {
-        match self.receiver.try_recv() {
-            Ok(Ok(event)) => Ok(Some(event)),
-            Ok(Err(error)) => Err(error),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::new(
+        match self.queue.try_pop() {
+            Some(Ok(event)) => Ok(Some(event)),
+            Some(Err(error)) => Err(error),
+            None if !self.queue.is_closed() => Ok(None),
+            None => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "terminal input reader stopped",
             )),
@@ -254,7 +401,7 @@ impl EventReader {
 
     /// Blocks until the next event or input-reader error.
     pub fn recv(&self) -> io::Result<Event> {
-        self.receiver.recv().map_err(|_| {
+        self.queue.pop().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "terminal input reader stopped",
@@ -262,9 +409,20 @@ impl EventReader {
         })?
     }
 
+    /// Returns whether the input thread has stopped and closed its queue.
+    pub fn is_stopped(&self) -> bool {
+        self.queue.is_closed()
+    }
+
+    /// Returns the pollable handle signaled by input and reader exit.
+    pub fn wakeup(&self) -> &Wakeup {
+        &self.wakeup
+    }
+
     /// Requests that the reader stop and waits for its thread to exit.
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.stop.store(true, Ordering::Release);
+        self.queue.close();
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
@@ -358,6 +516,64 @@ mod tests {
                 modifiers: Modifiers::SHIFT,
             }))
         );
+    }
+
+    #[test]
+    fn coalesces_only_adjacent_compatible_pointer_motion() {
+        let wakeup = Wakeup::new().unwrap();
+        let queue = EventQueue {
+            capacity: 4,
+            state: Mutex::new(EventQueueState::default()),
+            changed: Condvar::new(),
+            wakeup,
+        };
+        let moved = |x| {
+            Event::Pointer(PointerEvent {
+                kind: PointerEventKind::Moved,
+                x,
+                y: 2,
+                modifiers: Modifiers::NONE,
+            })
+        };
+        assert!(queue.push(Ok(moved(1))));
+        assert!(queue.push(Ok(moved(3))));
+        assert!(queue.push(Ok(Event::Focus(true))));
+        assert!(queue.push(Ok(moved(5))));
+
+        assert_eq!(queue.try_pop().unwrap().unwrap(), moved(3));
+        assert_eq!(queue.try_pop().unwrap().unwrap(), Event::Focus(true));
+        assert_eq!(queue.try_pop().unwrap().unwrap(), moved(5));
+        assert!(queue.try_pop().is_none());
+    }
+
+    #[test]
+    fn applies_backpressure_instead_of_dropping_non_motion_events() {
+        let queue = Arc::new(EventQueue {
+            capacity: 1,
+            state: Mutex::new(EventQueueState::default()),
+            changed: Condvar::new(),
+            wakeup: Wakeup::new().unwrap(),
+        });
+        assert!(queue.push(Ok(Event::Focus(true))));
+        let producer_queue = queue.clone();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            assert!(producer_queue.push(Ok(Event::Focus(false))));
+            finished_sender.send(()).unwrap();
+        });
+
+        started_receiver.recv().unwrap();
+        assert!(finished_receiver
+            .recv_timeout(Duration::from_millis(20))
+            .is_err());
+        assert_eq!(queue.try_pop().unwrap().unwrap(), Event::Focus(true));
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(queue.try_pop().unwrap().unwrap(), Event::Focus(false));
+        producer.join().unwrap();
     }
 
     #[test]

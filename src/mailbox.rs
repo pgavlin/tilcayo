@@ -1,11 +1,43 @@
 use std::sync::{Arc, Condvar, Mutex};
 
-use super::{Frame, Rect};
+use super::{kitty::Placement, Frame, Rect};
 
-/// A single-slot mailbox that retains the most recently submitted frame.
+/// An immutable frame presentation request.
 ///
-/// Submission does not wait for capacity. If another frame is pending, the new
-/// frame replaces it; a frame already taken by a consumer is unaffected.
+/// Placement is captured when the request is constructed, so a later resize or
+/// placement change cannot alter where an already submitted frame is drawn.
+#[derive(Clone, Debug)]
+pub struct Presentation {
+    frame: Frame,
+    placement: Placement,
+}
+
+impl Presentation {
+    /// Captures `frame` and its terminal-cell `placement` in one request.
+    pub fn new(frame: Frame, placement: Placement) -> Self {
+        Self { frame, placement }
+    }
+
+    /// Returns the submitted frame.
+    pub fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
+    /// Returns the placement captured for this frame.
+    pub fn placement(&self) -> Placement {
+        self.placement
+    }
+
+    /// Decomposes this request into its frame and placement.
+    pub fn into_parts(self) -> (Frame, Placement) {
+        (self.frame, self.placement)
+    }
+}
+
+/// A single-slot mailbox that retains the most recently submitted presentation.
+///
+/// Submission does not wait for capacity. If another request is pending, the
+/// new request replaces it; a request already taken by a consumer is unaffected.
 /// "Latest" means most recently submitted—the mailbox does not inspect or order
 /// frame serials. Clones share the same pending slot and closure state.
 ///
@@ -17,7 +49,7 @@ use super::{Frame, Rect};
 /// their clipped bounding rectangle to bound damage bookkeeping.
 ///
 /// Closing the mailbox rejects new submissions and wakes blocked consumers. A
-/// frame already pending remains available before the mailbox reports closure.
+/// request already pending remains available before the mailbox reports closure.
 #[derive(Clone, Default)]
 pub struct LatestFrameMailbox {
     shared: Arc<(Mutex<State>, Condvar)>,
@@ -25,47 +57,54 @@ pub struct LatestFrameMailbox {
 
 #[derive(Default)]
 struct State {
-    pending: Option<Frame>,
+    pending: Option<Presentation>,
     wake: bool,
     closed: bool,
     dropped: u64,
 }
 
 pub(crate) enum MailboxEvent {
-    Frame(Frame),
+    Presentation(Presentation),
     Wake,
     Closed,
 }
 
 impl LatestFrameMailbox {
-    /// Submits a frame, replacing any pending frame and preserving its damage.
+    /// Submits a request, replacing any pending request and preserving damage.
     ///
-    /// Returns the supplied frame unchanged if the mailbox is closed.
-    pub fn submit(&self, mut frame: Frame) -> Result<(), Frame> {
+    /// Returns the supplied request unchanged if the mailbox is closed.
+    pub fn submit(&self, mut presentation: Presentation) -> Result<(), Presentation> {
         let (lock, ready) = &*self.shared;
         let mut state = lock.lock().expect("latest-frame mailbox poisoned");
         if state.closed {
-            return Err(frame);
+            return Err(presentation);
         }
         if let Some(old) = state.pending.take() {
-            if old.size() == frame.size() {
-                frame.damage.extend(old.damage);
-                frame.damage = coalesce_bounds(frame.damage, frame.width, frame.height);
+            if old.frame.size() == presentation.frame.size() {
+                presentation.frame.damage.extend(old.frame.damage);
+                presentation.frame.damage = coalesce_bounds(
+                    presentation.frame.damage,
+                    presentation.frame.width,
+                    presentation.frame.height,
+                );
             } else {
-                frame.damage = vec![Rect::full(frame.width, frame.height)];
+                presentation.frame.damage = vec![Rect::full(
+                    presentation.frame.width,
+                    presentation.frame.height,
+                )];
             }
             state.dropped += 1;
         }
-        state.pending = Some(frame);
+        state.pending = Some(presentation);
         ready.notify_one();
         Ok(())
     }
 
-    /// Blocks until a frame is available or the mailbox is closed.
-    pub fn take(&self) -> Option<Frame> {
+    /// Blocks until a presentation is available or the mailbox is closed.
+    pub fn take(&self) -> Option<Presentation> {
         loop {
             match self.take_event() {
-                MailboxEvent::Frame(frame) => return Some(frame),
+                MailboxEvent::Presentation(presentation) => return Some(presentation),
                 MailboxEvent::Wake => {}
                 MailboxEvent::Closed => return None,
             }
@@ -78,8 +117,8 @@ impl LatestFrameMailbox {
         while state.pending.is_none() && !state.wake && !state.closed {
             state = ready.wait(state).expect("latest-frame mailbox poisoned");
         }
-        if let Some(frame) = state.pending.take() {
-            MailboxEvent::Frame(frame)
+        if let Some(presentation) = state.pending.take() {
+            MailboxEvent::Presentation(presentation)
         } else if state.wake {
             state.wake = false;
             MailboxEvent::Wake
@@ -97,8 +136,8 @@ impl LatestFrameMailbox {
         }
     }
 
-    /// Takes the pending frame without blocking.
-    pub fn try_take(&self) -> Option<Frame> {
+    /// Takes the pending presentation without blocking.
+    pub fn try_take(&self) -> Option<Presentation> {
         self.shared
             .0
             .lock()
@@ -109,7 +148,7 @@ impl LatestFrameMailbox {
 
     /// Closes the mailbox and wakes blocked consumers.
     ///
-    /// A frame already pending remains available for one final take.
+    /// A presentation already pending remains available for one final take.
     pub fn close(&self) {
         let (lock, ready) = &*self.shared;
         lock.lock().expect("latest-frame mailbox poisoned").closed = true;
@@ -143,22 +182,26 @@ fn coalesce_bounds(mut damage: Vec<Rect>, width: u32, height: u32) -> Vec<Rect> 
 mod tests {
     use super::*;
 
-    fn frame(serial: u64, damage: Vec<Rect>) -> Frame {
-        Frame::rgb(serial, 2, 2, 6, vec![0; 12], damage).unwrap()
+    fn presentation(serial: u64, damage: Vec<Rect>, column: u16) -> Presentation {
+        Presentation::new(
+            Frame::rgb(serial, 2, 2, 6, vec![0; 12], damage).unwrap(),
+            Placement::new(column, 0, 2, 2).unwrap(),
+        )
     }
 
     #[test]
     fn replacement_is_bounded_and_preserves_damage() {
         let mailbox = LatestFrameMailbox::default();
         mailbox
-            .submit(frame(1, vec![Rect::new(0, 0, 1, 1)]))
+            .submit(presentation(1, vec![Rect::new(0, 0, 1, 1)], 0))
             .unwrap();
         mailbox
-            .submit(frame(2, vec![Rect::new(1, 1, 1, 1)]))
+            .submit(presentation(2, vec![Rect::new(1, 1, 1, 1)], 1))
             .unwrap();
         let latest = mailbox.try_take().unwrap();
-        assert_eq!(latest.serial, 2);
-        assert_eq!(latest.damage.len(), 2);
+        assert_eq!(latest.frame().serial, 2);
+        assert_eq!(latest.frame().damage.len(), 2);
+        assert_eq!(latest.placement().column, 1);
         assert_eq!(mailbox.dropped(), 1);
     }
 }

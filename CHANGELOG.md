@@ -10,6 +10,9 @@ The format is based on [Keep a Changelog], and this project adheres to
 ### Added
 
 - Initial damage-aware Kitty graphics presentation pipeline.
+- Atomic frame-and-placement presentation requests.
+- Pollable input, presentation-completion, failure, and shutdown wakeups.
+- Bounded terminal input with adjacent pointer-motion coalescing.
 
 [Unreleased]: https://github.com/pgavlin/tilcayo/commits/main
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/

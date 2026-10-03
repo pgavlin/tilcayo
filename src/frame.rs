@@ -10,9 +10,10 @@ use super::Rect;
 /// rest. An empty damage list means that pixel content is unchanged, although a
 /// presenter may still initialize a new image or update its placement.
 ///
-/// Presenters may clip or coalesce damage rectangles. When a pending frame is
-/// replaced in a [`crate::LatestFrameMailbox`], its damage is carried into the
-/// replacement so pixels changed by a skipped frame are eventually presented.
+/// Presenters may clip or coalesce damage rectangles. When a pending
+/// presentation is replaced in a [`crate::LatestFrameMailbox`], its frame's
+/// damage is carried into the replacement so pixels changed by a skipped frame
+/// are eventually presented.
 /// Tilcayo's Kitty presenter sends a first frame or a framebuffer-size change
 /// in full regardless of its damage list.
 #[derive(Clone, Debug)]
