@@ -107,6 +107,20 @@ impl DamageCase {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BarrierTiming {
+    total: Duration,
+    write: Duration,
+    wait: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SampleTiming {
+    total: Duration,
+    present: Duration,
+    barrier: BarrierTiming,
+}
+
 #[derive(Debug)]
 struct ResultGroup {
     suite: Suite,
@@ -115,10 +129,17 @@ struct ResultGroup {
     config: BenchmarkConfig,
     mode: UpdateMode,
     case: DamageCase,
-    samples: Vec<Duration>,
+    samples: Vec<SampleTiming>,
     presented_pixels: u64,
     wire_bytes: usize,
     medium: Option<TransferMedium>,
+}
+
+#[derive(Debug)]
+struct BenchmarkResults {
+    barrier_before: Vec<BarrierTiming>,
+    groups: Vec<ResultGroup>,
+    barrier_after: Vec<BarrierTiming>,
 }
 
 struct BenchmarkTerminal;
@@ -178,7 +199,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let image_id = (std::process::id() | 0x4000_0000).max(1);
     let barrier_id = image_id.wrapping_add(1).max(1);
-    let results = run_benchmarks(
+    let barrier_before = measure_barrier_baseline(&args, barrier_id, &mut input, &mut output)?;
+    let groups = run_benchmarks(
         &args,
         capabilities,
         native,
@@ -188,6 +210,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut input,
         &mut output,
     )?;
+    let barrier_after = measure_barrier_baseline(&args, barrier_id, &mut input, &mut output)?;
+    let results = BenchmarkResults {
+        barrier_before,
+        groups,
+        barrier_after,
+    };
 
     drop(output);
     drop(input);
@@ -232,7 +260,7 @@ fn run_benchmarks(
                             Vec::new(),
                         )?;
                         presenter.present(output, &initial, placement)?;
-                        terminal_barrier(output, input, barrier_id)?;
+                        let _ = terminal_barrier(output, input, barrier_id)?;
                     }
 
                     let frame = Frame::rgb(
@@ -248,7 +276,7 @@ fn run_benchmarks(
                             presenter.invalidate();
                         }
                         presenter.present(output, &frame, placement)?;
-                        terminal_barrier(output, input, barrier_id)?;
+                        let _ = terminal_barrier(output, input, barrier_id)?;
                     }
 
                     let mut samples = Vec::with_capacity(args.samples);
@@ -261,15 +289,20 @@ fn run_benchmarks(
                         }
                         let started = Instant::now();
                         let stats = presenter.present(output, &frame, placement)?;
-                        terminal_barrier(output, input, barrier_id)?;
-                        samples.push(started.elapsed());
+                        let present = started.elapsed();
+                        let barrier = terminal_barrier(output, input, barrier_id)?;
+                        samples.push(SampleTiming {
+                            total: started.elapsed(),
+                            present,
+                            barrier,
+                        });
                         presented_pixels = stats.pixels;
                         wire_bytes = stats.wire_bytes;
                         medium = stats.medium;
                     }
 
                     presenter.delete(output)?;
-                    terminal_barrier(output, input, barrier_id)?;
+                    let _ = terminal_barrier(output, input, barrier_id)?;
                     results.push(ResultGroup {
                         suite: args.suite,
                         width,
@@ -435,17 +468,39 @@ fn benchmark_frame(width: u32, height: u32) -> Vec<u8> {
     pixels
 }
 
+fn measure_barrier_baseline(
+    args: &Args,
+    image_id: u32,
+    input: &mut (impl Read + AsRawFd),
+    output: &mut impl Write,
+) -> io::Result<Vec<BarrierTiming>> {
+    for _ in 0..args.warmups {
+        let _ = terminal_barrier(output, input, image_id)?;
+    }
+    (0..args.samples)
+        .map(|_| terminal_barrier(output, input, image_id))
+        .collect()
+}
+
 fn terminal_barrier(
     output: &mut impl Write,
     input: &mut (impl Read + AsRawFd),
     image_id: u32,
-) -> io::Result<()> {
+) -> io::Result<BarrierTiming> {
+    let started = Instant::now();
     write!(
         output,
         "\x1b_Gi={image_id},s=1,v=1,a=q,t=d,f=24,q=0;AAAA\x1b\\"
     )?;
     output.flush()?;
-    wait_for_response(input, image_id)
+    let written = Instant::now();
+    wait_for_response(input, image_id)?;
+    let completed = Instant::now();
+    Ok(BarrierTiming {
+        total: completed.duration_since(started),
+        write: written.duration_since(started),
+        wait: completed.duration_since(written),
+    })
 }
 
 fn wait_for_response(input: &mut (impl Read + AsRawFd), image_id: u32) -> io::Result<()> {
@@ -510,7 +565,9 @@ fn wait_for_response(input: &mut (impl Read + AsRawFd), image_id: u32) -> io::Re
     }
 }
 
-fn write_results(args: &Args, native: (u32, u32), results: &[ResultGroup]) -> io::Result<()> {
+const CSV_COLUMNS: usize = 33;
+
+fn write_results(args: &Args, native: (u32, u32), results: &BenchmarkResults) -> io::Result<()> {
     if let Some(parent) = args
         .output
         .parent()
@@ -548,70 +605,134 @@ fn write_results(args: &Args, native: (u32, u32), results: &[ResultGroup]) -> io
     writeln!(output, "# samples={}", args.samples)?;
     writeln!(
         output,
-        "row,suite,screen_width,screen_height,transport,zlib,chunk_size,mode,case,damage_rects,damage_pixels,bounds_width,bounds_height,presented_pixels,wire_bytes,actual_medium,sample_index,elapsed_ms,p50_ms,p90_ms,p99_ms"
+        "row,suite,screen_width,screen_height,transport,zlib,chunk_size,mode,case,damage_rects,damage_pixels,bounds_width,bounds_height,presented_pixels,wire_bytes,actual_medium,sample_index,elapsed_ms,p50_ms,p90_ms,p99_ms,present_ms,barrier_write_ms,ack_wait_ms,present_p50_ms,present_p90_ms,present_p99_ms,barrier_write_p50_ms,barrier_write_p90_ms,barrier_write_p99_ms,ack_wait_p50_ms,ack_wait_p90_ms,ack_wait_p99_ms"
     )?;
 
-    for result in results {
-        let bounds = result.case.bounds();
-        let chunk = result.config.chunk_name();
-        let medium = medium_name(result.medium);
-        for (index, elapsed) in result.samples.iter().enumerate() {
-            writeln!(
-                output,
-                "sample,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},,,",
-                result.suite.name(),
-                result.width,
-                result.height,
-                result.config.transport_name,
-                result.config.zlib_name,
-                chunk,
-                result.mode.name(),
-                result.case.name,
-                result.case.rects.len(),
-                result.case.pixels(),
-                bounds.width,
-                bounds.height,
-                result.presented_pixels,
-                result.wire_bytes,
-                medium,
-                index,
-                elapsed.as_secs_f64() * 1000.0,
-            )?;
-        }
-        let (p50, p90, p99) = percentiles(&result.samples);
-        writeln!(
-            output,
-            "summary,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},,,{:.6},{:.6},{:.6}",
-            result.suite.name(),
-            result.width,
-            result.height,
-            result.config.transport_name,
-            result.config.zlib_name,
-            chunk,
-            result.mode.name(),
-            result.case.name,
-            result.case.rects.len(),
-            result.case.pixels(),
-            bounds.width,
-            bounds.height,
-            result.presented_pixels,
-            result.wire_bytes,
-            medium,
-            p50.as_secs_f64() * 1000.0,
-            p90.as_secs_f64() * 1000.0,
-            p99.as_secs_f64() * 1000.0,
-        )?;
+    write_barrier_results(&mut output, args, native, "before", &results.barrier_before)?;
+    for result in &results.groups {
+        write_result_group(&mut output, result)?;
     }
+    write_barrier_results(&mut output, args, native, "after", &results.barrier_after)?;
     output.flush()
 }
 
-fn print_summary(args: &Args, results: &[ResultGroup]) {
+fn write_result_group(output: &mut impl Write, result: &ResultGroup) -> io::Result<()> {
+    for (index, sample) in result.samples.iter().enumerate() {
+        let mut row = result_row("sample", result);
+        row[16] = index.to_string();
+        row[17] = milliseconds(sample.total);
+        row[21] = milliseconds(sample.present);
+        row[22] = milliseconds(sample.barrier.write);
+        row[23] = milliseconds(sample.barrier.wait);
+        write_csv_row(output, row)?;
+    }
+
+    let mut row = result_row("summary", result);
+    set_percentiles(&mut row, 18, &result.samples, |sample| sample.total);
+    set_percentiles(&mut row, 24, &result.samples, |sample| sample.present);
+    set_percentiles(&mut row, 27, &result.samples, |sample| sample.barrier.write);
+    set_percentiles(&mut row, 30, &result.samples, |sample| sample.barrier.wait);
+    write_csv_row(output, row)
+}
+
+fn result_row(kind: &str, result: &ResultGroup) -> Vec<String> {
+    let bounds = result.case.bounds();
+    let mut row = vec![String::new(); CSV_COLUMNS];
+    row[0] = kind.to_owned();
+    row[1] = result.suite.name().to_owned();
+    row[2] = result.width.to_string();
+    row[3] = result.height.to_string();
+    row[4] = result.config.transport_name.to_owned();
+    row[5] = result.config.zlib_name.to_owned();
+    row[6] = result.config.chunk_name();
+    row[7] = result.mode.name().to_owned();
+    row[8] = result.case.name.to_owned();
+    row[9] = result.case.rects.len().to_string();
+    row[10] = result.case.pixels().to_string();
+    row[11] = bounds.width.to_string();
+    row[12] = bounds.height.to_string();
+    row[13] = result.presented_pixels.to_string();
+    row[14] = result.wire_bytes.to_string();
+    row[15] = medium_name(result.medium).to_owned();
+    row
+}
+
+fn write_barrier_results(
+    output: &mut impl Write,
+    args: &Args,
+    native: (u32, u32),
+    phase: &str,
+    samples: &[BarrierTiming],
+) -> io::Result<()> {
+    for (index, sample) in samples.iter().enumerate() {
+        let mut row = barrier_row("barrier-sample", args, native, phase);
+        row[16] = index.to_string();
+        row[17] = milliseconds(sample.total);
+        row[22] = milliseconds(sample.write);
+        row[23] = milliseconds(sample.wait);
+        write_csv_row(output, row)?;
+    }
+    let mut row = barrier_row("barrier-summary", args, native, phase);
+    set_percentiles(&mut row, 18, samples, |sample| sample.total);
+    set_percentiles(&mut row, 27, samples, |sample| sample.write);
+    set_percentiles(&mut row, 30, samples, |sample| sample.wait);
+    write_csv_row(output, row)
+}
+
+fn barrier_row(kind: &str, args: &Args, native: (u32, u32), phase: &str) -> Vec<String> {
+    let mut row = vec![String::new(); CSV_COLUMNS];
+    row[0] = kind.to_owned();
+    row[1] = args.suite.name().to_owned();
+    row[2] = native.0.to_string();
+    row[3] = native.1.to_string();
+    row[4] = "none".to_owned();
+    row[5] = "none".to_owned();
+    row[6] = "none".to_owned();
+    row[7] = "barrier-only".to_owned();
+    row[8] = phase.to_owned();
+    row[15] = "none".to_owned();
+    row
+}
+
+fn write_csv_row(output: &mut impl Write, row: Vec<String>) -> io::Result<()> {
+    debug_assert_eq!(row.len(), CSV_COLUMNS);
+    writeln!(output, "{}", row.join(","))
+}
+
+fn set_percentiles<T>(
+    row: &mut [String],
+    start: usize,
+    samples: &[T],
+    select: impl Fn(&T) -> Duration,
+) {
+    let values: Vec<_> = samples.iter().map(select).collect();
+    let (p50, p90, p99) = percentiles(&values);
+    row[start] = milliseconds(p50);
+    row[start + 1] = milliseconds(p90);
+    row[start + 2] = milliseconds(p99);
+}
+
+fn milliseconds(duration: Duration) -> String {
+    format!("{:.6}", duration.as_secs_f64() * 1000.0)
+}
+
+fn print_summary(args: &Args, results: &BenchmarkResults) {
     eprintln!("benchmark CSV: {}", args.output.display());
-    eprintln!("p50 / p90 / p99 acknowledgement latency (ms)");
-    for result in results {
-        let (p50, p90, p99) = percentiles(&result.samples);
+    print_barrier_summary("barrier before", &results.barrier_before);
+    eprintln!("end-to-end p50/p90/p99; presentation p50; acknowledgement wait p50 (ms)");
+    for result in &results.groups {
+        let totals: Vec<_> = result.samples.iter().map(|sample| sample.total).collect();
+        let presents: Vec<_> = result.samples.iter().map(|sample| sample.present).collect();
+        let waits: Vec<_> = result
+            .samples
+            .iter()
+            .map(|sample| sample.barrier.wait)
+            .collect();
+        let (p50, p90, p99) = percentiles(&totals);
+        let (present, _, _) = percentiles(&presents);
+        let (wait, _, _) = percentiles(&waits);
         eprintln!(
-            "{:>4}x{:<4} {:<13} {:<15} {:<12} {:>9.3} / {:>9.3} / {:>9.3}",
+            "{:>4}x{:<4} {:<13} {:<15} {:<12} {:>7.3}/{:>7.3}/{:>7.3} {:>9.3} {:>9.3}",
             result.width,
             result.height,
             result.mode.name(),
@@ -620,8 +741,26 @@ fn print_summary(args: &Args, results: &[ResultGroup]) {
             p50.as_secs_f64() * 1000.0,
             p90.as_secs_f64() * 1000.0,
             p99.as_secs_f64() * 1000.0,
+            present.as_secs_f64() * 1000.0,
+            wait.as_secs_f64() * 1000.0,
         );
     }
+    print_barrier_summary("barrier after", &results.barrier_after);
+}
+
+fn print_barrier_summary(label: &str, samples: &[BarrierTiming]) {
+    let totals: Vec<_> = samples.iter().map(|sample| sample.total).collect();
+    let writes: Vec<_> = samples.iter().map(|sample| sample.write).collect();
+    let waits: Vec<_> = samples.iter().map(|sample| sample.wait).collect();
+    let (total, _, _) = percentiles(&totals);
+    let (write, _, _) = percentiles(&writes);
+    let (wait, _, _) = percentiles(&waits);
+    eprintln!(
+        "{label}: total p50 {:.3}, write p50 {:.3}, acknowledgement wait p50 {:.3} ms",
+        total.as_secs_f64() * 1000.0,
+        write.as_secs_f64() * 1000.0,
+        wait.as_secs_f64() * 1000.0,
+    );
 }
 
 fn percentiles(samples: &[Duration]) -> (Duration, Duration, Duration) {

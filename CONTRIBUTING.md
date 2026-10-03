@@ -69,8 +69,16 @@ direct-chunk matrix. The matrix is intended for broad regression checks rather
 than the inner before/after loop. Run `--help` for all options.
 
 The output CSV contains every raw sample, summary p50/p90/p99 rows, workload
-metadata, and available environment versions. The benchmark temporarily takes
-over terminal input and uses the alternate screen. Do not type while it runs.
+metadata, and available environment versions. Each presentation sample is
+split into application-side presentation time, barrier-command write time, and
+acknowledgement wait time, alongside the original end-to-end duration. The
+benchmark also records barrier-only samples before and after the workload. These
+controls quantify the terminal query and event-loop latency included in every
+acknowledgement; they should not be subtracted sample-by-sample as though they
+were independent work.
+
+The benchmark temporarily takes over terminal input and uses the alternate
+screen. Do not type while it runs.
 
 ### Benchmark discipline
 
