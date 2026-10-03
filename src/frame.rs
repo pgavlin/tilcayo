@@ -1,4 +1,4 @@
-use std::{io, sync::Arc, time::Instant};
+use std::{borrow::Cow, io, sync::Arc, time::Instant};
 
 use super::Rect;
 
@@ -82,15 +82,69 @@ impl Frame {
     ///
     /// Returns an error when the rectangle does not overlap the framebuffer.
     pub fn region_rgb(&self, rect: Rect) -> io::Result<Vec<u8>> {
+        self.region_rgb_data(rect).map(Cow::into_owned)
+    }
+
+    pub(crate) fn region_rgb_data(&self, rect: Rect) -> io::Result<Cow<'_, [u8]>> {
         let rect = rect.clip(self.width, self.height).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "damage is outside framebuffer")
         })?;
         let row_bytes = rect.width as usize * 3;
+        let start = rect.y as usize * self.stride + rect.x as usize * 3;
+        if rect.height == 1 || (rect.x == 0 && row_bytes == self.stride) {
+            let len = row_bytes * rect.height as usize;
+            return Ok(Cow::Borrowed(&self.pixels[start..start + len]));
+        }
+
         let mut result = Vec::with_capacity(row_bytes * rect.height as usize);
         for y in rect.y..rect.y + rect.height {
             let start = y as usize * self.stride + rect.x as usize * 3;
             result.extend_from_slice(&self.pixels[start..start + row_bytes]);
         }
-        Ok(result)
+        Ok(Cow::Owned(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn borrows_contiguous_regions_and_copies_strided_regions() {
+        let packed = Frame::rgb(
+            1,
+            2,
+            2,
+            6,
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            vec![],
+        )
+        .unwrap();
+        assert!(matches!(
+            packed.region_rgb_data(Rect::full(2, 2)).unwrap(),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            packed.region_rgb_data(Rect::new(1, 0, 1, 1)).unwrap(),
+            Cow::Borrowed(&[3, 4, 5])
+        ));
+        assert!(matches!(
+            packed.region_rgb_data(Rect::new(1, 0, 1, 2)).unwrap(),
+            Cow::Owned(ref bytes) if bytes == &[3, 4, 5, 9, 10, 11]
+        ));
+
+        let padded = Frame::rgb(
+            2,
+            2,
+            2,
+            8,
+            vec![0, 1, 2, 3, 4, 5, 99, 99, 6, 7, 8, 9, 10, 11, 99, 99],
+            vec![],
+        )
+        .unwrap();
+        assert!(matches!(
+            padded.region_rgb_data(Rect::full(2, 2)).unwrap(),
+            Cow::Owned(ref bytes) if bytes == &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        ));
     }
 }

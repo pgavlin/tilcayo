@@ -198,7 +198,7 @@ impl KittyPresenter {
         };
         if initialize {
             let full = Rect::full(frame.width, frame.height);
-            let rgb = frame.region_rgb(full)?;
+            let rgb = frame.region_rgb_data(full)?;
             write!(
                 writer,
                 "\x1b[{};{}H",
@@ -216,7 +216,7 @@ impl KittyPresenter {
                     placement.columns,
                     placement.rows
                 ),
-                &rgb,
+                rgb.as_ref(),
                 false,
                 self.transfer_options,
             )?;
@@ -239,14 +239,14 @@ impl KittyPresenter {
             )?;
         }
         for &rect in damage {
-            let rgb = frame.region_rgb(rect)?;
+            let rgb = frame.region_rgb_data(rect)?;
             let transfer = self.transmitter.transmit(
                 writer,
                 &format!(
                     "a=f,r=1,i={},f=24,q=2,x={},y={},s={},v={},X=1",
                     self.image_id, rect.x, rect.y, rect.width, rect.height
                 ),
-                &rgb,
+                rgb.as_ref(),
                 true,
                 self.transfer_options,
             )?;
