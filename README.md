@@ -78,9 +78,19 @@ Run a damage-tracked mouse painting demo:
 cargo run --release --example paint
 ```
 
-In either example, press `q` or Escape to exit. In the painting demo, drag with
+Run the completion-paced, source-derived AMICUS Boing Ball demo:
+
+```sh
+cargo run --release --example boing_ball
+```
+
+In any example, press `q` or Escape to exit. In the painting demo, drag with
 the mouse to draw, use different mouse buttons for different colors, and press
-`c` to clear the canvas.
+`c` to clear the canvas. In the Boing Ball demo, press Space to pause or `r`
+to restart the animation. Its 320×216 indexed framebuffer, wireframe room,
+faceted ball, palette cycling, and fixed-step physics follow the analyzed AMICUS
+Disk 9 variant; see [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for
+credits.
 
 ## License
 

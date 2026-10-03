@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog], and this project adheres to
 - Atomic frame-and-placement presentation requests.
 - Pollable input, presentation-completion, failure, and shutdown wakeups.
 - Bounded terminal input with adjacent pointer-motion coalescing.
+- Completion-paced, damage-tracked Boing Ball example.
 
 ### Changed
 
