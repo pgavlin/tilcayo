@@ -28,6 +28,5 @@ rather than allowed to accumulate. Tilcayo presentation completions provide
 submission backpressure, but indicate terminal writes rather than display
 acknowledgements.
 
-The player package currently requires Rust 1.85 because the FFmpeg 9 bindings
-use Cargo's 2024-edition support. The Tilcayo library itself retains Rust 1.80
-as its minimum supported version.
+The player package and Tilcayo library require Rust 1.85. The FFmpeg 9 bindings
+use Cargo's 2024-edition support.

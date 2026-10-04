@@ -47,6 +47,7 @@ pub(crate) fn adapt(event: CrosstermEvent) -> io::Result<Option<Event>> {
             Some(Event::Resize(size))
         }
         CrosstermEvent::Paste(value) => Some(Event::Paste(value)),
+        CrosstermEvent::TerminalResponse(_) => None,
     })
 }
 
@@ -309,46 +310,22 @@ impl EventReader {
     /// motions occupy one slot regardless of how many are received.
     pub fn spawn_with_capacity(capacity: usize) -> io::Result<Self> {
         let wakeup = Wakeup::new()?;
-        Self::spawn_with_events_and_wakeup(Vec::new(), capacity, wakeup)
+        Self::spawn_with_wakeup(capacity, wakeup)
     }
 
-    pub(crate) fn spawn_with_events_and_wakeup(
-        initial: Vec<Event>,
-        capacity: usize,
-        wakeup: Wakeup,
-    ) -> io::Result<Self> {
+    pub(crate) fn spawn_with_wakeup(capacity: usize, wakeup: Wakeup) -> io::Result<Self> {
         if capacity == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "terminal event capacity must be nonzero",
             ));
         }
-        let mut initial_state = EventQueueState::default();
-        for event in initial {
-            if let Some(Ok(previous)) = initial_state.events.back_mut() {
-                if replaceable_motion(previous, &event) {
-                    *previous = event;
-                    continue;
-                }
-            }
-            if initial_state.events.len() == capacity {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "probe-time input exceeds terminal event capacity",
-                ));
-            }
-            initial_state.events.push_back(Ok(event));
-        }
-        let has_initial = !initial_state.events.is_empty();
         let queue = Arc::new(EventQueue {
             capacity,
-            state: Mutex::new(initial_state),
+            state: Mutex::new(EventQueueState::default()),
             changed: Condvar::new(),
             wakeup: wakeup.clone(),
         });
-        if has_initial {
-            wakeup.signal();
-        }
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let worker_queue = queue.clone();
@@ -366,14 +343,18 @@ impl EventReader {
                     if !ready {
                         continue;
                     }
-                    let result = event::read().and_then(|event| {
-                        adapt(event)?.ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "ignored terminal event")
-                        })
-                    });
-                    let failed = result.is_err();
-                    if !worker_queue.push(result) || failed {
-                        break;
+                    let result = event::read().and_then(adapt);
+                    match result {
+                        Ok(Some(event)) => {
+                            if !worker_queue.push(Ok(event)) {
+                                break;
+                            }
+                        }
+                        Ok(None) => continue,
+                        Err(error) => {
+                            let _ = worker_queue.push(Err(error));
+                            break;
+                        }
                     }
                 }
                 worker_queue.close();

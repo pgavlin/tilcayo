@@ -310,7 +310,7 @@ impl Lab {
             damage.extend(self.previous_visual.iter().copied());
             self.previous_visual = visual.clone();
         } else {
-            damage.extend(self.previous_visual.drain(..));
+            damage.append(&mut self.previous_visual);
         }
 
         draw_hud(

@@ -9,8 +9,7 @@ use std::{
 };
 
 use tilcayo::kitty::{
-    probe_terminal_with_events, GraphicsTransport, KittyPresenter, Placement, TransferOptions,
-    ZlibPolicy,
+    probe_terminal, GraphicsTransport, KittyPresenter, Placement, TransferOptions, ZlibPolicy,
 };
 use tilcayo::{Frame, Rect};
 
@@ -86,6 +85,18 @@ fn presenter_writes_complete_commands_through_a_pty() {
     assert!(output.contains("a=T,f=24,s=2,v=2,i=9"));
 }
 
+struct StdinRestore(i32);
+
+impl Drop for StdinRestore {
+    fn drop(&mut self) {
+        assert_eq!(
+            unsafe { libc::dup2(self.0, libc::STDIN_FILENO) },
+            libc::STDIN_FILENO
+        );
+        unsafe { libc::close(self.0) };
+    }
+}
+
 #[test]
 fn fake_terminal_answers_fragmented_capability_probe() {
     let mut master_fd = -1;
@@ -103,23 +114,31 @@ fn fake_terminal_answers_fragmented_capability_probe() {
         0
     );
     let mut master = unsafe { File::from_raw_fd(master_fd) };
-    let mut input = unsafe { File::from_raw_fd(slave_fd) };
-    let mut output = input.try_clone().unwrap();
+    let mut output = unsafe { File::from_raw_fd(slave_fd) };
     let mut attributes = MaybeUninit::<libc::termios>::uninit();
     assert_eq!(
-        unsafe { libc::tcgetattr(input.as_raw_fd(), attributes.as_mut_ptr()) },
+        unsafe { libc::tcgetattr(output.as_raw_fd(), attributes.as_mut_ptr()) },
         0
     );
     let mut attributes = unsafe { attributes.assume_init() };
     unsafe { libc::cfmakeraw(&mut attributes) };
     assert_eq!(
-        unsafe { libc::tcsetattr(input.as_raw_fd(), libc::TCSANOW, &attributes) },
+        unsafe { libc::tcsetattr(output.as_raw_fd(), libc::TCSANOW, &attributes) },
         0
     );
+
+    let saved_stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
+    assert!(saved_stdin >= 0);
+    assert_eq!(
+        unsafe { libc::dup2(output.as_raw_fd(), libc::STDIN_FILENO) },
+        libc::STDIN_FILENO
+    );
+    let restore_stdin = StdinRestore(saved_stdin);
 
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     let terminal = std::thread::spawn(move || {
         let mut pending = Vec::new();
+        let mut injected_input = false;
         loop {
             let mut bytes = [0; 512];
             let count = master.read(&mut bytes).unwrap();
@@ -131,15 +150,22 @@ fn fake_terminal_answers_fragmented_capability_probe() {
                     let start = command.find("i=").unwrap() + 2;
                     let end = command[start..].find(',').unwrap() + start;
                     let id = &command[start..end];
+                    if !injected_input {
+                        master.write_all(b"q").unwrap();
+                    }
                     master.write_all(b"\x1b_").unwrap();
                     master.write_all(format!("Gi={id}").as_bytes()).unwrap();
                     master.write_all(b";O").unwrap();
                     master.write_all(b"K\x1b\\").unwrap();
-                }
-                if command.contains("+q") {
+                    if !injected_input {
+                        master.write_all(b"x").unwrap();
+                        injected_input = true;
+                    }
+                } else if command.contains("6b697474792d71756572792d6470695f78") {
                     master
                         .write_all(b"\x1bP1+r6b697474792d71756572792d6470695f78=313434\x1b\\")
                         .unwrap();
+                } else if command.contains("6b697474792d71756572792d6470695f79") {
                     master
                         .write_all(b"\x1bP1+r6b697474792d71756572792d6470695f79=313434\x1b\\")
                         .unwrap();
@@ -149,12 +175,19 @@ fn fake_terminal_answers_fragmented_capability_probe() {
             }
         }
     });
-    let (probe, events) =
-        probe_terminal_with_events(&mut input, &mut output, std::time::Duration::from_secs(1))
-            .unwrap();
+
+    let probe = probe_terminal(&mut output, std::time::Duration::from_secs(1)).unwrap();
+    for expected in ['q', 'x'] {
+        assert!(matches!(
+            crossterm::event::read().unwrap(),
+            crossterm::event::Event::Key(event)
+                if event.code == crossterm::event::KeyCode::Char(expected)
+        ));
+    }
     release_sender.send(()).unwrap();
+    drop(restore_stdin);
+    drop(output);
     terminal.join().unwrap();
-    assert!(events.is_empty());
     assert!(probe.graphics.graphics);
     assert!(probe.graphics.animation);
     assert!(probe.graphics.transient);

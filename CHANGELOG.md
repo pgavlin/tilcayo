@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ### Changed
 
+- Raised the minimum supported Rust version from 1.80 to 1.85.
+- Replaced the split Termwiz/Crossterm probe input path with Crossterm terminal queries, preserving startup input in the normal event queue without a parser handoff.
+- Simplified `kitty::probe` and `kitty::probe_terminal` to use Crossterm's terminal input reader; removed the separate `*_with_events` and `wait_for_ack` APIs.
 - Made validated `Frame` layout and damage fields private and exposed read-only accessors.
 - Automatic graphics transport now falls back to direct transfer when local media fail.
 

@@ -191,7 +191,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let capabilities = probe(
-        &mut input,
         &mut output,
         Duration::from_millis(RESPONSE_TIMEOUT_MS as u64),
     )?;

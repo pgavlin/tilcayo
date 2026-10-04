@@ -1,7 +1,7 @@
 # Contributing
 
 Contributions should preserve Tilcayo's terminal correctness, public API quality,
-and Rust 1.80 minimum supported version.
+and Rust 1.85 minimum supported version.
 
 Before submitting a change, run:
 

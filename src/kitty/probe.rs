@@ -1,29 +1,20 @@
 use std::{
     ffi::CString,
+    fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     os::fd::{AsRawFd, FromRawFd},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
-use termwiz::{
-    escape::{apc::KittyImageData, parser::Parser, Action, KittyImage},
-    input::{InputEvent, InputParser, KeyCode as TermwizKeyCode, Modifiers as TermwizModifiers},
+use crossterm::{
+    event::{self, QueryCommand, QueryResponse, TerminalResponse, TerminalResponseKind},
+    Command,
 };
 
-use crate::{Event, KeyCode, KeyEvent, LogicalDpi, Modifiers};
-
-// Runtime input ownership is deliberately phased. During this module's probe,
-// advanced terminal input modes are still disabled and Termwiz parses both
-// Kitty APC replies and any basic keystrokes that share the byte stream. Those
-// keystrokes are translated and queued before Crossterm becomes the sole input
-// reader. This avoids concurrent readers and preserves Crossterm's richer
-// steady-state handling, but it is not a transferable parser state: a sequence
-// fragmented exactly across the handoff remains a theoretical edge case. A
-// Kitty-only parser would not remove that limitation unless Crossterm also
-// gained a public API for injecting unconsumed bytes or extending its parser.
+use crate::LogicalDpi;
 
 /// Kitty graphics features verified by active terminal queries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -49,132 +40,58 @@ pub struct TerminalProbe {
     pub logical_dpi: Option<LogicalDpi>,
 }
 
-/// Actively probes Kitty graphics before the normal Crossterm event reader is
-/// started.
+/// Actively probes Kitty graphics before the normal event reader is started.
 ///
-/// This convenience function discards concurrent startup keystrokes. Runtime
-/// integrations should prefer [`probe_with_events`] and enqueue its events.
-pub fn probe(
-    input: &mut (impl Read + AsRawFd),
-    output: &mut impl Write,
-    timeout: Duration,
-) -> io::Result<GraphicsCapabilities> {
-    probe_terminal(input, output, timeout).map(|probe| probe.graphics)
+/// Crossterm remains the sole terminal-input parser throughout probing. Input
+/// events received while a query is pending stay in Crossterm's event queue and
+/// are delivered by the normal reader after this function returns. Terminal
+/// input must already be in raw mode so responses are available immediately.
+pub fn probe(output: &mut impl Write, timeout: Duration) -> io::Result<GraphicsCapabilities> {
+    probe_terminal(output, timeout).map(|probe| probe.graphics)
 }
 
-/// Probe graphics support and Kitty's logical DPI.
+/// Probes Kitty graphics support and logical DPI.
 ///
-/// This convenience function discards concurrent startup keystrokes. Runtime
-/// integrations should prefer [`probe_terminal_with_events`].
-pub fn probe_terminal(
-    input: &mut (impl Read + AsRawFd),
-    output: &mut impl Write,
-    timeout: Duration,
-) -> io::Result<TerminalProbe> {
-    probe_terminal_with_events(input, output, timeout).map(|(probe, _)| probe)
-}
-
-/// Probe graphics support while decoding unrelated startup keystrokes instead
-/// of discarding them. Termwiz handles fragmented APC framing and unenhanced
-/// keyboard input. Mouse, focus, paste, and keyboard-enhancement reporting
-/// modes must not yet be enabled.
-pub fn probe_with_events(
-    input: &mut (impl Read + AsRawFd),
-    output: &mut impl Write,
-    timeout: Duration,
-) -> io::Result<(GraphicsCapabilities, Vec<Event>)> {
-    probe_terminal_with_events(input, output, timeout)
-        .map(|(probe, events)| (probe.graphics, events))
-}
-
-/// Probe graphics support and Kitty's logical DPI while preserving unrelated
-/// startup keystrokes. All queries share the supplied timeout.
-pub fn probe_terminal_with_events(
-    input: &mut (impl Read + AsRawFd),
-    output: &mut impl Write,
-    timeout: Duration,
-) -> io::Result<(TerminalProbe, Vec<Event>)> {
-    let id = std::process::id().wrapping_add(0x5759).max(1);
-    write!(output, "\x1b_Gi={id},s=1,v=1,a=q,t=d,f=24,q=0;AAAA\x1b\\")?;
-    output.flush()?;
-
+/// All queries share `timeout`. A query is not emitted once that common
+/// deadline has expired. Crossterm preserves unrelated terminal input in its
+/// event queue for subsequent calls to its event APIs. Terminal input must
+/// already be in raw mode so responses are available immediately.
+pub fn probe_terminal(output: &mut impl Write, timeout: Duration) -> io::Result<TerminalProbe> {
     let deadline = deadline_after(timeout);
-    let mut decoder = ProbeDecoder::default();
-    let graphics = wait_for_ack_preserving(input, id, deadline, &mut decoder)?;
+    let id = std::process::id().wrapping_add(0x5759).max(1);
+    let graphics = query_kitty(
+        output,
+        format!("\x1b_Gi={id},s=1,v=1,a=q,t=d,f=24,q=0;AAAA\x1b\\"),
+        &[id],
+        deadline,
+    )?
+    .is_some_and(|response| response.id == id && response.ok);
+
     let mut shared_memory = false;
     let mut temporary_file = false;
     let mut animation = false;
     let mut transient = false;
 
     if graphics {
-        transient = probe_transient_hint(input, output, deadline, &mut decoder)?;
+        transient = probe_transient_hint(output, deadline)?;
         if local_media_eligible() {
-            shared_memory = probe_shared_memory(input, output, deadline, &mut decoder)?;
-            temporary_file = probe_temporary_file(input, output, deadline, &mut decoder)?;
+            shared_memory = probe_shared_memory(output, deadline)?;
+            temporary_file = probe_temporary_file(output, deadline)?;
         }
-        animation = probe_animation(input, output, deadline, &mut decoder)?;
+        animation = probe_animation(output, deadline)?;
     }
-    let logical_dpi = probe_logical_dpi(input, output, deadline, &mut decoder)?;
+    let logical_dpi = probe_logical_dpi(output, deadline)?;
 
-    let events = decoder.finish();
-    Ok((
-        TerminalProbe {
-            graphics: GraphicsCapabilities {
-                graphics,
-                shared_memory,
-                temporary_file,
-                animation,
-                transient,
-            },
-            logical_dpi,
+    Ok(TerminalProbe {
+        graphics: GraphicsCapabilities {
+            graphics,
+            shared_memory,
+            temporary_file,
+            animation,
+            transient,
         },
-        events,
-    ))
-}
-
-/// Waits for a particular Kitty acknowledgement using Termwiz's parser.
-/// Returns false for a Kitty error reply or a timeout.
-pub fn wait_for_ack(
-    input: &mut (impl Read + AsRawFd),
-    id: u32,
-    timeout: Duration,
-) -> io::Result<bool> {
-    let deadline = deadline_after(timeout);
-    let mut parser = Parser::new();
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd: input.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
-        if ready == 0 {
-            break;
-        }
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        let mut bytes = [0; 256];
-        let count = input.read(&mut bytes)?;
-        if count == 0 {
-            break;
-        }
-        let mut response = None;
-        parser.parse(&bytes[..count], |action| {
-            if let Some(ok) = response_for(&action, id) {
-                response = Some(ok);
-            }
-        });
-        if let Some(ok) = response {
-            return Ok(ok);
-        }
-    }
-    Ok(false)
+        logical_dpi,
+    })
 }
 
 fn deadline_after(timeout: Duration) -> Instant {
@@ -188,38 +105,127 @@ fn deadline_after(timeout: Duration) -> Instant {
     }
 }
 
+fn remaining(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+}
+
 fn local_media_eligible() -> bool {
     std::env::var_os("SSH_CONNECTION").is_none()
         && std::env::var_os("TMUX").is_none()
         && std::env::var_os("STY").is_none()
 }
 
-fn probe_transient_hint(
-    input: &mut (impl Read + AsRawFd),
+#[derive(Debug)]
+struct KittyResponse {
+    id: u32,
+    ok: bool,
+}
+
+impl QueryResponse for KittyResponse {
+    const KIND: TerminalResponseKind = TerminalResponseKind::Apc;
+}
+
+struct KittyQuery {
+    command: String,
+    ids: Vec<u32>,
+}
+
+impl Command for KittyQuery {
+    fn write_ansi(&self, writer: &mut impl fmt::Write) -> fmt::Result {
+        writer.write_str(&self.command)
+    }
+}
+
+impl QueryCommand for KittyQuery {
+    type Response = KittyResponse;
+
+    fn parse_response(
+        &self,
+        response: TerminalResponse,
+    ) -> Result<Self::Response, TerminalResponse> {
+        match parse_kitty_response(response.as_bytes()) {
+            Some(parsed) if self.ids.contains(&parsed.id) => Ok(parsed),
+            _ => Err(response),
+        }
+    }
+}
+
+fn query_kitty(
     output: &mut impl Write,
+    command: String,
+    ids: &[u32],
     deadline: Instant,
-    decoder: &mut ProbeDecoder,
-) -> io::Result<bool> {
+) -> io::Result<Option<KittyResponse>> {
+    let Some(timeout) = remaining(deadline) else {
+        return Ok(None);
+    };
+    match event::query(
+        output,
+        KittyQuery {
+            command,
+            ids: ids.to_vec(),
+        },
+        timeout,
+    ) {
+        Ok(response) => Ok(Some(response)),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_kitty_response(bytes: &[u8]) -> Option<KittyResponse> {
+    let body = bytes
+        .strip_prefix(b"\x1b_G")
+        .and_then(|body| body.strip_suffix(b"\x1b\\"))
+        .or_else(|| {
+            bytes
+                .strip_prefix(b"\x9fG")
+                .and_then(|body| body.strip_suffix(b"\x9c"))
+        })?;
+    let separator = body.iter().position(|byte| *byte == b';')?;
+    let (control, payload) = (&body[..separator], &body[separator + 1..]);
+    let id = control.split(|byte| *byte == b',').find_map(|field| {
+        field
+            .strip_prefix(b"i=")
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse().ok())
+    })?;
+    Some(KittyResponse {
+        id,
+        ok: payload == b"OK",
+    })
+}
+
+fn probe_transient_hint(output: &mut impl Write, deadline: Instant) -> io::Result<bool> {
     let id = std::process::id().wrapping_add(0x575d).max(1);
     let sentinel_id = std::process::id().wrapping_add(0x575e).max(1);
     // Older Kitty versions reject an unknown N key without producing a
     // graphics response. Follow the extension query with a baseline query so
     // that rejection can be distinguished from an unresponsive terminal.
-    write!(
+    let response = query_kitty(
         output,
-        "\x1b_Gi={id},s=1,v=1,a=q,t=d,f=24,q=0,N=1;AAAA\x1b\\\x1b_Gi={sentinel_id},s=1,v=1,a=q,t=d,f=24,q=0;AAAA\x1b\\"
+        format!(
+            "\x1b_Gi={id},s=1,v=1,a=q,t=d,f=24,q=0,N=1;AAAA\x1b\\\x1b_Gi={sentinel_id},s=1,v=1,a=q,t=d,f=24,q=0;AAAA\x1b\\"
+        ),
+        &[id, sentinel_id],
+        deadline,
     )?;
-    output.flush()?;
-    wait_for_either_ack_preserving(input, id, sentinel_id, deadline, decoder)
-        .map(|response| response == Some((id, true)))
+    let supported = response
+        .as_ref()
+        .is_some_and(|response| response.id == id && response.ok);
+
+    // A supporting terminal normally replies to both commands in order. If
+    // the extension response completed the query, consume the already-issued
+    // sentinel reply before changing the expected response framing.
+    if response.is_some_and(|response| response.id == id) {
+        let _ = query_kitty(output, String::new(), &[sentinel_id], deadline)?;
+    }
+    Ok(supported)
 }
 
-fn probe_shared_memory(
-    input: &mut (impl Read + AsRawFd),
-    output: &mut impl Write,
-    deadline: Instant,
-    decoder: &mut ProbeDecoder,
-) -> io::Result<bool> {
+fn probe_shared_memory(output: &mut impl Write, deadline: Instant) -> io::Result<bool> {
     let object = match ProbeShm::new(b"\0\0\0") {
         Ok(object) => object,
         Err(_) => return Ok(false),
@@ -229,20 +235,16 @@ fn probe_shared_memory(
         &base64::engine::general_purpose::STANDARD,
         object.name.as_bytes(),
     );
-    write!(
+    query_kitty(
         output,
-        "\x1b_Gi={id},s=1,v=1,a=q,t=s,f=24,q=0,S=3;{name}\x1b\\"
-    )?;
-    output.flush()?;
-    wait_for_ack_preserving(input, id, deadline, decoder)
+        format!("\x1b_Gi={id},s=1,v=1,a=q,t=s,f=24,q=0,S=3;{name}\x1b\\"),
+        &[id],
+        deadline,
+    )
+    .map(|response| response.is_some_and(|response| response.ok))
 }
 
-fn probe_temporary_file(
-    input: &mut (impl Read + AsRawFd),
-    output: &mut impl Write,
-    deadline: Instant,
-    decoder: &mut ProbeDecoder,
-) -> io::Result<bool> {
+fn probe_temporary_file(output: &mut impl Write, deadline: Instant) -> io::Result<bool> {
     let object = match ProbeTemp::new(b"\0\0\0") {
         Ok(object) => object,
         Err(_) => return Ok(false),
@@ -252,60 +254,91 @@ fn probe_temporary_file(
         &base64::engine::general_purpose::STANDARD,
         object.path.as_os_str().as_encoded_bytes(),
     );
-    write!(
+    query_kitty(
         output,
-        "\x1b_Gi={id},s=1,v=1,a=q,t=t,f=24,q=0,S=3;{path}\x1b\\"
-    )?;
-    output.flush()?;
-    wait_for_ack_preserving(input, id, deadline, decoder)
+        format!("\x1b_Gi={id},s=1,v=1,a=q,t=t,f=24,q=0,S=3;{path}\x1b\\"),
+        &[id],
+        deadline,
+    )
+    .map(|response| response.is_some_and(|response| response.ok))
 }
 
 const DPI_X_QUERY: &str = "kitty-query-dpi_x";
 const DPI_Y_QUERY: &str = "kitty-query-dpi_y";
 
-fn probe_logical_dpi(
-    input: &mut (impl Read + AsRawFd),
-    output: &mut impl Write,
-    deadline: Instant,
-    decoder: &mut ProbeDecoder,
-) -> io::Result<Option<LogicalDpi>> {
-    write!(
-        output,
-        "\x1bP+q{};{}\x1b\\",
-        hex_encode(DPI_X_QUERY.as_bytes()),
-        hex_encode(DPI_Y_QUERY.as_bytes())
-    )?;
-    output.flush()?;
+#[derive(Debug)]
+struct TerminalCapabilityResponse(f64);
 
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        if let Some(dpi) = decoder.logical_dpi() {
-            return Ok(Some(dpi));
-        }
-        let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd: input.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
-        if ready == 0 {
-            break;
-        }
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        let mut bytes = [0; 256];
-        let count = input.read(&mut bytes)?;
-        if count == 0 {
-            break;
-        }
-        decoder.feed(&bytes[..count], 0);
+impl QueryResponse for TerminalCapabilityResponse {
+    const KIND: TerminalResponseKind = TerminalResponseKind::Dcs;
+}
+
+struct TerminalCapabilityQuery {
+    name: &'static str,
+}
+
+impl Command for TerminalCapabilityQuery {
+    fn write_ansi(&self, writer: &mut impl fmt::Write) -> fmt::Result {
+        write!(writer, "\x1bP+q{}\x1b\\", hex_encode(self.name.as_bytes()))
     }
-    Ok(decoder.logical_dpi())
+}
+
+impl QueryCommand for TerminalCapabilityQuery {
+    type Response = TerminalCapabilityResponse;
+
+    fn parse_response(
+        &self,
+        response: TerminalResponse,
+    ) -> Result<Self::Response, TerminalResponse> {
+        match parse_terminal_capability(response.as_bytes(), self.name) {
+            Some(value) => Ok(TerminalCapabilityResponse(value)),
+            None => Err(response),
+        }
+    }
+}
+
+fn query_terminal_capability(
+    output: &mut impl Write,
+    name: &'static str,
+    deadline: Instant,
+) -> io::Result<Option<f64>> {
+    let Some(timeout) = remaining(deadline) else {
+        return Ok(None);
+    };
+    match event::query(output, TerminalCapabilityQuery { name }, timeout) {
+        Ok(TerminalCapabilityResponse(value)) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn probe_logical_dpi(output: &mut impl Write, deadline: Instant) -> io::Result<Option<LogicalDpi>> {
+    let Some(x) = query_terminal_capability(output, DPI_X_QUERY, deadline)? else {
+        return Ok(None);
+    };
+    let Some(y) = query_terminal_capability(output, DPI_Y_QUERY, deadline)? else {
+        return Ok(None);
+    };
+    Ok(LogicalDpi::new(x, y))
+}
+
+fn parse_terminal_capability(bytes: &[u8], expected_name: &str) -> Option<f64> {
+    let body = bytes
+        .strip_prefix(b"\x1bP1+r")
+        .and_then(|body| body.strip_suffix(b"\x1b\\"))
+        .or_else(|| {
+            bytes
+                .strip_prefix(b"\x901+r")
+                .and_then(|body| body.strip_suffix(b"\x9c"))
+        })?;
+    let separator = body.iter().position(|byte| *byte == b'=')?;
+    let (name, value) = (&body[..separator], &body[separator + 1..]);
+    let (name, value) = (hex_decode(name)?, hex_decode(value)?);
+    if name != expected_name.as_bytes() {
+        return None;
+    }
+    let value = std::str::from_utf8(&value).ok()?.parse::<f64>().ok()?;
+    (value.is_finite() && (1.0..=1000.0).contains(&value)).then_some(value)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -318,24 +351,39 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn probe_animation(
-    input: &mut (impl Read + AsRawFd),
-    output: &mut impl Write,
-    deadline: Instant,
-    decoder: &mut ProbeDecoder,
-) -> io::Result<bool> {
+fn hex_decode(encoded: &[u8]) -> Option<Vec<u8>> {
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    encoded
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+fn probe_animation(output: &mut impl Write, deadline: Instant) -> io::Result<bool> {
     let id = std::process::id().wrapping_add(0x575b).max(1);
-    write!(output, "\x1b_Gi={id},s=1,v=1,a=t,t=d,f=24,q=0;AAAA\x1b\\")?;
-    output.flush()?;
-    if !wait_for_ack_preserving(input, id, deadline, decoder)? {
+    let transmitted = query_kitty(
+        output,
+        format!("\x1b_Gi={id},s=1,v=1,a=t,t=d,f=24,q=0;AAAA\x1b\\"),
+        &[id],
+        deadline,
+    )?
+    .is_some_and(|response| response.ok);
+    if !transmitted {
         return Ok(false);
     }
-    write!(
+    let supported = query_kitty(
         output,
-        "\x1b_Gi={id},a=f,r=1,x=0,y=0,s=1,v=1,t=d,f=24,X=1,q=0;AAAA\x1b\\"
-    )?;
-    output.flush()?;
-    let supported = wait_for_ack_preserving(input, id, deadline, decoder)?;
+        format!("\x1b_Gi={id},a=f,r=1,x=0,y=0,s=1,v=1,t=d,f=24,X=1,q=0;AAAA\x1b\\"),
+        &[id],
+        deadline,
+    )?
+    .is_some_and(|response| response.ok);
     write!(output, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\")?;
     output.flush()?;
     Ok(supported)
@@ -443,318 +491,6 @@ impl Drop for ProbeTemp {
     }
 }
 
-fn wait_for_either_ack_preserving(
-    input: &mut (impl Read + AsRawFd),
-    primary_id: u32,
-    sentinel_id: u32,
-    deadline: Instant,
-    decoder: &mut ProbeDecoder,
-) -> io::Result<Option<(u32, bool)>> {
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd: input.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
-        if ready == 0 {
-            break;
-        }
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        let mut bytes = [0; 256];
-        let count = input.read(&mut bytes)?;
-        if count == 0 {
-            break;
-        }
-        if let Some(response) = decoder.feed_either(&bytes[..count], primary_id, sentinel_id) {
-            return Ok(Some(response));
-        }
-    }
-    Ok(None)
-}
-
-fn wait_for_ack_preserving(
-    input: &mut (impl Read + AsRawFd),
-    id: u32,
-    deadline: Instant,
-    decoder: &mut ProbeDecoder,
-) -> io::Result<bool> {
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd: input.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
-        if ready == 0 {
-            break;
-        }
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        let mut bytes = [0; 256];
-        let count = input.read(&mut bytes)?;
-        if count == 0 {
-            break;
-        }
-        if let Some(ok) = decoder.feed(&bytes[..count], id) {
-            return Ok(ok);
-        }
-    }
-    Ok(false)
-}
-
-#[derive(Default)]
-struct ProbeDecoder {
-    undecoded: Vec<u8>,
-    input: InputParser,
-    events: Vec<Event>,
-    dpi_x: Option<f64>,
-    dpi_y: Option<f64>,
-}
-
-#[derive(Clone, Copy)]
-enum ProtocolString {
-    KittyGraphics,
-    DeviceControl,
-}
-
-impl ProbeDecoder {
-    fn feed(&mut self, bytes: &[u8], id: u32) -> Option<bool> {
-        self.feed_matching(bytes, &[id]).map(|(_, ok)| ok)
-    }
-
-    fn feed_either(
-        &mut self,
-        bytes: &[u8],
-        primary_id: u32,
-        sentinel_id: u32,
-    ) -> Option<(u32, bool)> {
-        self.feed_matching(bytes, &[primary_id, sentinel_id])
-    }
-
-    fn feed_matching(&mut self, bytes: &[u8], ids: &[u32]) -> Option<(u32, bool)> {
-        const KITTY_PREFIX: &[u8] = b"\x1b_G";
-        const DCS_PREFIX: &[u8] = b"\x1bP";
-        const STRING_TERMINATOR: &[u8] = b"\x1b\\";
-
-        self.undecoded.extend_from_slice(bytes);
-        let mut response = None;
-        loop {
-            let kitty = find_bytes(&self.undecoded, KITTY_PREFIX)
-                .map(|start| (start, ProtocolString::KittyGraphics));
-            let dcs = find_bytes(&self.undecoded, DCS_PREFIX)
-                .map(|start| (start, ProtocolString::DeviceControl));
-            let Some((start, kind)) = earliest(kitty, dcs) else {
-                let retained = if self.undecoded.ends_with(b"\x1b_") {
-                    2
-                } else if self.undecoded.ends_with(b"\x1b") {
-                    1
-                } else {
-                    0
-                };
-                let ready = self.undecoded.len() - retained;
-                self.feed_input_prefix(ready, true);
-                break;
-            };
-            if start != 0 {
-                self.feed_input_prefix(start, true);
-                continue;
-            }
-            let prefix_len = match kind {
-                ProtocolString::KittyGraphics => KITTY_PREFIX.len(),
-                ProtocolString::DeviceControl => DCS_PREFIX.len(),
-            };
-            let Some(end) = find_bytes(&self.undecoded[prefix_len..], STRING_TERMINATOR) else {
-                break;
-            };
-            let command_len = prefix_len + end + STRING_TERMINATOR.len();
-            let command: Vec<_> = self.undecoded.drain(..command_len).collect();
-            match kind {
-                ProtocolString::KittyGraphics => {
-                    let mut parser = Parser::new();
-                    for action in parser.parse_as_vec(&command) {
-                        if let Some(value) =
-                            graphics_response(&action).filter(|(id, _)| ids.contains(id))
-                        {
-                            if value.0 == ids[0] || response.is_none() {
-                                response = Some(value);
-                            }
-                        }
-                    }
-                }
-                ProtocolString::DeviceControl => self.accept_terminal_query(&command),
-            }
-        }
-        response
-    }
-
-    fn accept_terminal_query(&mut self, command: &[u8]) {
-        let Some(body) = command
-            .strip_prefix(b"\x1bP1+r")
-            .and_then(|body| body.strip_suffix(b"\x1b\\"))
-        else {
-            return;
-        };
-        let Some(separator) = body.iter().position(|byte| *byte == b'=') else {
-            return;
-        };
-        let (name, value) = (&body[..separator], &body[separator + 1..]);
-        let (Some(name), Some(value)) = (hex_decode(name), hex_decode(value)) else {
-            return;
-        };
-        let Some(value) = std::str::from_utf8(&value)
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-        else {
-            return;
-        };
-        if !value.is_finite() || !(1.0..=1000.0).contains(&value) {
-            return;
-        }
-        match name.as_slice() {
-            b"kitty-query-dpi_x" => self.dpi_x = Some(value),
-            b"kitty-query-dpi_y" => self.dpi_y = Some(value),
-            _ => {}
-        }
-    }
-
-    fn logical_dpi(&self) -> Option<LogicalDpi> {
-        LogicalDpi::new(self.dpi_x?, self.dpi_y?)
-    }
-
-    fn feed_input_prefix(&mut self, len: usize, maybe_more: bool) {
-        if len == 0 {
-            return;
-        }
-        let bytes: Vec<_> = self.undecoded.drain(..len).collect();
-        let events = &mut self.events;
-        self.input.parse(
-            &bytes,
-            |event| {
-                if let Some(event) = adapt_probe_input(event) {
-                    events.push(event);
-                }
-            },
-            maybe_more,
-        );
-    }
-
-    fn finish(mut self) -> Vec<Event> {
-        let len = self.undecoded.len();
-        self.feed_input_prefix(len, false);
-        let events = &mut self.events;
-        self.input.parse(
-            &[],
-            |event| {
-                if let Some(event) = adapt_probe_input(event) {
-                    events.push(event);
-                }
-            },
-            false,
-        );
-        self.events
-    }
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn earliest(
-    left: Option<(usize, ProtocolString)>,
-    right: Option<(usize, ProtocolString)>,
-) -> Option<(usize, ProtocolString)> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
-}
-
-fn hex_decode(encoded: &[u8]) -> Option<Vec<u8>> {
-    if encoded.len() % 2 != 0 {
-        return None;
-    }
-    encoded
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = (pair[0] as char).to_digit(16)?;
-            let low = (pair[1] as char).to_digit(16)?;
-            Some(((high << 4) | low) as u8)
-        })
-        .collect()
-}
-
-fn adapt_probe_input(event: InputEvent) -> Option<Event> {
-    let InputEvent::Key(key) = event else {
-        return None;
-    };
-    let code = match key.key {
-        TermwizKeyCode::Char(value) => KeyCode::Char(value),
-        TermwizKeyCode::Backspace => KeyCode::Backspace,
-        TermwizKeyCode::Enter => KeyCode::Enter,
-        TermwizKeyCode::LeftArrow | TermwizKeyCode::ApplicationLeftArrow => KeyCode::Left,
-        TermwizKeyCode::RightArrow | TermwizKeyCode::ApplicationRightArrow => KeyCode::Right,
-        TermwizKeyCode::UpArrow | TermwizKeyCode::ApplicationUpArrow => KeyCode::Up,
-        TermwizKeyCode::DownArrow | TermwizKeyCode::ApplicationDownArrow => KeyCode::Down,
-        TermwizKeyCode::Home | TermwizKeyCode::KeyPadHome => KeyCode::Home,
-        TermwizKeyCode::End | TermwizKeyCode::KeyPadEnd => KeyCode::End,
-        TermwizKeyCode::PageUp | TermwizKeyCode::KeyPadPageUp => KeyCode::PageUp,
-        TermwizKeyCode::PageDown | TermwizKeyCode::KeyPadPageDown => KeyCode::PageDown,
-        TermwizKeyCode::Tab => KeyCode::Tab,
-        TermwizKeyCode::Delete => KeyCode::Delete,
-        TermwizKeyCode::Insert => KeyCode::Insert,
-        TermwizKeyCode::Function(number) => KeyCode::F(number),
-        TermwizKeyCode::Escape => KeyCode::Esc,
-        _ => return None,
-    };
-    let mut modifiers = Modifiers::NONE;
-    if key.modifiers.contains(TermwizModifiers::SHIFT) {
-        modifiers |= Modifiers::SHIFT;
-    }
-    if key.modifiers.contains(TermwizModifiers::ALT) {
-        modifiers |= Modifiers::ALT;
-    }
-    if key.modifiers.contains(TermwizModifiers::CTRL) {
-        modifiers |= Modifiers::CONTROL;
-    }
-    if key.modifiers.contains(TermwizModifiers::SUPER) {
-        modifiers |= Modifiers::SUPER;
-    }
-    Some(Event::Key(KeyEvent::new(code, modifiers)))
-}
-
-fn graphics_response(action: &Action) -> Option<(u32, bool)> {
-    let Action::KittyImage(image) = action else {
-        return None;
-    };
-    let KittyImage::TransmitData { transmit, .. } = image.as_ref() else {
-        return None;
-    };
-    let id = transmit.image_id?;
-    let ok = matches!(&transmit.data, KittyImageData::Direct(payload) if payload == "OK");
-    Some((id, ok))
-}
-
-fn response_for(action: &Action, id: u32) -> Option<bool> {
-    graphics_response(action).and_then(|(response_id, ok)| (response_id == id).then_some(ok))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,6 +498,20 @@ mod tests {
     #[test]
     fn excessive_probe_timeouts_are_bounded_without_panicking() {
         assert!(deadline_after(Duration::MAX) > Instant::now());
+    }
+
+    #[test]
+    fn expired_deadlines_do_not_emit_queries() {
+        let mut output = Vec::new();
+        let response = query_kitty(
+            &mut output,
+            "query".to_owned(),
+            &[1],
+            Instant::now() - Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(response.is_none());
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -774,119 +524,39 @@ mod tests {
     }
 
     #[test]
-    fn maintained_parser_handles_fragmented_kitty_reply() {
-        let id = 77;
-        let mut parser = Parser::new();
-        let mut ok = false;
-        for chunk in [
-            b"\x1b_".as_slice(),
-            b"Gi=77".as_slice(),
-            b";O".as_slice(),
-            b"K\x1b\\".as_slice(),
-        ] {
-            parser.parse(chunk, |action| {
-                ok |= response_for(&action, id) == Some(true)
-            });
-        }
-        assert!(ok);
+    fn parses_kitty_acknowledgements() {
+        assert!(parse_kitty_response(b"\x1b_Gi=77;OK\x1b\\").unwrap().ok);
+        let error = parse_kitty_response(b"\x1b_Gi=77;EINVAL\x1b\\").unwrap();
+        assert_eq!(error.id, 77);
+        assert!(!error.ok);
     }
 
     #[test]
-    fn rejects_an_error_reply() {
-        let mut parser = Parser::new();
-        assert!(!parser
-            .parse_as_vec(b"\x1b_Gi=77;EINVAL\x1b\\")
-            .iter()
-            .any(|action| response_for(action, 77) == Some(true)));
-    }
-
-    #[test]
-    fn usage_hint_probe_accepts_a_sentinel_for_unsupported_terminals() {
-        let mut decoder = ProbeDecoder::default();
+    fn parses_valid_logical_dpi_responses() {
         assert_eq!(
-            decoder.feed_either(b"\x1b_Gi=78;OK\x1b\\", 77, 78),
-            Some((78, true))
+            parse_terminal_capability(
+                b"\x1bP1+r6b697474792d71756572792d6470695f78=3134342e35\x1b\\",
+                DPI_X_QUERY,
+            ),
+            Some(144.5)
         );
-    }
-
-    #[test]
-    fn unsupported_usage_hint_probe_does_not_wait_for_timeout() {
-        use std::{os::unix::net::UnixStream, thread};
-
-        let (client, mut terminal) = UnixStream::pair().unwrap();
-        let mut input = client.try_clone().unwrap();
-        let mut output = client;
-        let sentinel_id = std::process::id().wrapping_add(0x575e).max(1);
-        let terminal = thread::spawn(move || {
-            let mut commands = Vec::new();
-            while commands
-                .windows(2)
-                .filter(|bytes| *bytes == b"\x1b\\")
-                .count()
-                < 2
-            {
-                let mut bytes = [0; 256];
-                let count = terminal.read(&mut bytes).unwrap();
-                commands.extend_from_slice(&bytes[..count]);
-            }
-            assert!(commands.windows(3).any(|bytes| bytes == b"N=1"));
-            write!(terminal, "\x1b_Gi={sentinel_id};OK\x1b\\").unwrap();
-        });
-        let mut decoder = ProbeDecoder::default();
-        assert!(!probe_transient_hint(
-            &mut input,
-            &mut output,
-            Instant::now() + Duration::from_secs(1),
-            &mut decoder,
-        )
-        .unwrap());
-        terminal.join().unwrap();
-    }
-
-    #[test]
-    fn usage_hint_probe_prefers_the_extension_response() {
-        let mut decoder = ProbeDecoder::default();
-        assert_eq!(
-            decoder.feed_either(b"\x1b_Gi=77;OK\x1b\\\x1b_Gi=78;OK\x1b\\", 77, 78),
-            Some((77, true))
-        );
-    }
-
-    #[test]
-    fn decodes_fragmented_logical_dpi_responses() {
-        let mut decoder = ProbeDecoder::default();
-        decoder.feed(b"\x1bP1+r6b697474792d71756572792d6470695f78=313434\x1b", 0);
-        assert_eq!(decoder.logical_dpi(), None);
-        decoder.feed(
-            b"\\\x1bP1+r6b697474792d71756572792d6470695f79=3132302e35\x1b\\",
-            0,
-        );
-        assert_eq!(decoder.logical_dpi(), LogicalDpi::new(144.0, 120.5));
     }
 
     #[test]
     fn rejects_invalid_logical_dpi_responses() {
-        let mut decoder = ProbeDecoder::default();
-        decoder.feed(b"\x1bP1+r6b697474792d71756572792d6470695f78=30\x1b\\", 0);
-        decoder.feed(
-            b"\x1bP1+r6b697474792d71756572792d6470695f79=4e614e\x1b\\",
-            0,
-        );
-        assert_eq!(decoder.logical_dpi(), None);
-    }
-
-    #[test]
-    fn probe_decoder_preserves_input_around_fragmented_reply() {
-        let mut decoder = ProbeDecoder::default();
-        assert_eq!(decoder.feed(b"q\x1b_", 77), None);
-        assert_eq!(decoder.feed(b"Gi=77;O", 77), None);
-        assert_eq!(decoder.feed(b"K\x1b\\x", 77), Some(true));
         assert_eq!(
-            decoder.finish(),
-            vec![
-                Event::Key(KeyEvent::new(KeyCode::Char('q'), Modifiers::NONE)),
-                Event::Key(KeyEvent::new(KeyCode::Char('x'), Modifiers::NONE))
-            ]
+            parse_terminal_capability(
+                b"\x1bP1+r6b697474792d71756572792d6470695f78=30\x1b\\",
+                DPI_X_QUERY,
+            ),
+            None
+        );
+        assert_eq!(
+            parse_terminal_capability(
+                b"\x1bP1+r6b697474792d71756572792d6470695f79=4e614e\x1b\\",
+                DPI_Y_QUERY,
+            ),
+            None
         );
     }
 }
