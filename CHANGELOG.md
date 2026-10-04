@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevented maximum placement origins from overflowing when converted to terminal coordinates.
+
 ## [0.2.0] - 2026-10-04
 
 ### Added

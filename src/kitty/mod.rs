@@ -212,8 +212,8 @@ impl KittyPresenter {
             write!(
                 writer,
                 "\x1b[{};{}H",
-                placement.row + 1,
-                placement.column + 1
+                u32::from(placement.row) + 1,
+                u32::from(placement.column) + 1
             )?;
             let transient = if self.transient { ",N=1" } else { "" };
             let transfer = self.transmitter.transmit(
@@ -242,8 +242,8 @@ impl KittyPresenter {
             write!(
                 writer,
                 "\x1b[{};{}H\x1b_Ga=p,i={},p={},q=2,C=1,c={},r={};\x1b\\",
-                placement.row + 1,
-                placement.column + 1,
+                u32::from(placement.row) + 1,
+                u32::from(placement.column) + 1,
                 self.image_id,
                 self.placement_id,
                 placement.columns,
@@ -353,6 +353,43 @@ mod tests {
         let (damage, initialize) = presenter.planned_damage(&damaged, false);
         assert!(!initialize);
         assert_eq!(damage.len(), 2);
+    }
+
+    #[test]
+    fn maximum_placement_origin_is_formatted_without_overflow() {
+        let maximum = Placement::new(u16::MAX, u16::MAX, 1, 1).unwrap();
+        let options = TransferOptions {
+            transport: GraphicsTransport::Direct,
+            zlib: ZlibPolicy::Never,
+            chunk_size: 4096,
+        };
+
+        let mut initial = KittyPresenter::new(7, false);
+        initial.set_transfer_options(options);
+        let mut output = Vec::new();
+        initial
+            .present(&mut output, &frame(1, vec![]), maximum)
+            .unwrap();
+        assert!(output
+            .windows(b"\x1b[65536;65536H".len())
+            .any(|window| window == b"\x1b[65536;65536H"));
+
+        let mut moved = KittyPresenter::new(7, false);
+        moved.set_transfer_options(options);
+        moved
+            .present(
+                &mut Vec::new(),
+                &frame(1, vec![]),
+                Placement::new(0, 0, 1, 1).unwrap(),
+            )
+            .unwrap();
+        let mut output = Vec::new();
+        moved
+            .present(&mut output, &frame(2, vec![]), maximum)
+            .unwrap();
+        assert!(output
+            .windows(b"\x1b[65536;65536H".len())
+            .any(|window| window == b"\x1b[65536;65536H"));
     }
 
     #[test]
