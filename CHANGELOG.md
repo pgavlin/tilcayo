@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-04
+
 ### Added
 
 - Initial damage-aware Kitty graphics presentation pipeline.
@@ -29,6 +31,7 @@ The format is based on [Keep a Changelog], and this project adheres to
 - Presenter exit wakeups and completion publication when instrumentation panics.
 - Ordered runtime shutdown after worker errors and presenter invalidation after failed deletion.
 
-[Unreleased]: https://github.com/pgavlin/tilcayo/commits/main
+[Unreleased]: https://github.com/pgavlin/tilcayo/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/pgavlin/tilcayo/releases/tag/v0.2.0
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
