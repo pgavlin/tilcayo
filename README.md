@@ -84,6 +84,12 @@ Run the completion-paced, source-derived AMICUS Boing Ball demo:
 cargo run --release --example boing_ball
 ```
 
+Inspect damage planning, presentation pacing, and mailbox replacement:
+
+```sh
+cargo run --release --example damage_lab
+```
+
 Play an MP4 with timestamp-paced video and audio:
 
 ```sh
@@ -105,7 +111,10 @@ the mouse to draw, use different mouse buttons for different colors, and press
 to restart the animation. Its 320×216 indexed framebuffer, wireframe room,
 faceted ball, palette cycling, and fixed-step physics follow the analyzed AMICUS
 Disk 9 variant; see [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for
-credits. In the MP4 player, press Space to pause or resume playback.
+credits. In the damage lab, use `1`–`4` to select sparse, bounding, full-frame,
+or many-rectangle damage; `p` toggles completion pacing, `d` toggles damage
+outlines, Space pauses, and `r` resets. In the MP4 player, press Space to pause
+or resume playback.
 
 ## License
 
